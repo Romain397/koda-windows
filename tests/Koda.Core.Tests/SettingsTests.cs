@@ -18,6 +18,9 @@ public class SettingsTests
 
         Assert.True(settings.CloseToTray);
         Assert.True(settings.Autoplay);
+        Assert.False(settings.SmoothMotion);
+        Assert.Equal(120, settings.SmoothMotionMaxFps);
+        Assert.False(settings.ShowsVideoStats);
         Assert.Equal(100, settings.Volume);
         Assert.Equal(3, settings.LyricsSources.Count);
     }
@@ -77,6 +80,9 @@ public class SettingsTests
             Crossfades = false,
             CrossfadeSeconds = 9,
             SharesOnDiscord = true,
+            SmoothMotion = true,
+            SmoothMotionMaxFps = 60,
+            ShowsVideoStats = true,
             CacheLimit = CacheLimit.Large,
             DisabledLyricsSources = [LyricsSource.BetterLyrics],
         };
@@ -99,6 +105,9 @@ public class SettingsTests
         Assert.False(back.Crossfades);
         Assert.Equal(9, back.CrossfadeSeconds);
         Assert.True(back.SharesOnDiscord);
+        Assert.True(back.SmoothMotion);
+        Assert.Equal(60, back.SmoothMotionMaxFps);
+        Assert.True(back.ShowsVideoStats);
         Assert.Equal(CacheLimit.Large, back.CacheLimit);
         Assert.False(back.IsEnabled(LyricsSource.BetterLyrics));
         Assert.True(back.IsEnabled(LyricsSource.YouLyPlus));
