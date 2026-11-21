@@ -16,6 +16,8 @@ namespace Koda.Services;
 public static class Profiles
 {
     private static bool _switching;
+    public static int HomeVersion { get; private set; }
+    public static bool IsSwitching => _switching;
 
     public static ProfileRoster Roster { get; } = new(App.DataDirectory);
 
@@ -56,6 +58,7 @@ public static class Profiles
 
     private static void ForgetSavedHome()
     {
+        HomeVersion++;
         try
         {
             File.Delete(Path.Combine(ActiveFolder, "home-snapshot.json"));
@@ -77,6 +80,7 @@ public static class Profiles
     {
         if (id == Roster.ActiveId || Roster.Profile(id) is not { } profile || _switching) return;
         _switching = true;
+        HomeVersion++;
         try
         {
             VideoPlaybackService.Instance.Stop();
@@ -86,6 +90,7 @@ public static class Profiles
                 new CredentialStore(ProfileRoster.CredentialTarget(profile)),
                 () => App.Library.Open(folder));
             Roster.SetActive(id);
+            App.MixSongs = [];
         }
         finally
         {

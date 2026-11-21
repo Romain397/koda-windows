@@ -67,6 +67,12 @@ public sealed class Settings
     };
 
     private static Settings? _current;
+    private readonly object _saveLock = new();
+    private string? _savePath;
+    private string? _loadedPath;
+    private ISecretStore? _losslessStore;
+    private string? _legacyLosslessUrl;
+    private string? _legacyLosslessSecret;
 
     /// <summary>The settings of this install.</summary>
     public static Settings Current => _current ??= Load();
@@ -237,18 +243,60 @@ public sealed class Settings
     public string? AudioDeviceId { get; set; }
 
     /// <summary>Download lossless FLAC from the listener's lossless server instead of YouTube streams.
-    /// Only takes effect once <see cref="LosslessServerUrl"/> is set.</summary>
+    /// Only takes effect once a server is configured.</summary>
     public bool LosslessDownloads { get; set; }
 
-    /// <summary>The lossless server's address, typed in by the listener; null until they do.</summary>
-    public string? LosslessServerUrl { get; set; }
+    [JsonIgnore]
+    public LosslessServerConfiguration? LosslessServer { get; private set; }
 
-    /// <summary>The lossless server's signing secret, if it asks for one; null signs nothing.</summary>
-    public string? LosslessServerSecret { get; set; }
+    // These properties only read settings from before the server moved to the credential store.
+    [JsonPropertyName("losslessServerUrl")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LegacyLosslessServerUrl { get => null; set => _legacyLosslessUrl = value; }
+
+    [JsonPropertyName("losslessServerSecret")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? LegacyLosslessServerSecret { get => null; set => _legacyLosslessSecret = value; }
 
     /// <summary>True when lossless downloads are on and there is a server to take them from.</summary>
     [JsonIgnore]
-    public bool UsesLosslessServer => LosslessDownloads && !string.IsNullOrWhiteSpace(LosslessServerUrl);
+    public bool UsesLosslessServer => LosslessDownloads && Koda.Core.LosslessServer.IsValidUrl(LosslessServer?.Url);
+
+    public void UseLosslessCredentialStore(ISecretStore store)
+    {
+        lock (_saveLock)
+        {
+            _losslessStore = store;
+            var saved = store.Read();
+            LosslessServer = saved is null ? null : JsonSerializer.Deserialize<LosslessServerConfiguration>(saved);
+            if (_legacyLosslessUrl is not null || _legacyLosslessSecret is not null)
+            {
+                SaveLocked();
+            }
+        }
+    }
+
+    public void ConfigureLosslessServer(LosslessServerConfiguration server)
+    {
+        if (!Koda.Core.LosslessServer.IsValidUrl(server.Url))
+        {
+            throw new ArgumentException("Enter an HTTPS server address, or a loopback address for a local server.");
+        }
+
+        lock (_saveLock)
+        {
+            WriteLosslessCredentials(server);
+            LosslessServer = server;
+        }
+        Save();
+        Changed?.Invoke(this);
+    }
+
+    private void WriteLosslessCredentials(LosslessServerConfiguration server)
+    {
+        var store = _losslessStore ?? throw new InvalidOperationException("The credential store is unavailable.");
+        store.Write(JsonSerializer.Serialize(server));
+    }
 
     /// <summary>Raised when a setting changes, so what listens to it can follow.</summary>
     public event Action<Settings>? Changed;
@@ -290,17 +338,57 @@ public sealed class Settings
     {
         try
         {
-            var directory = System.IO.Path.GetDirectoryName(Path);
-            if (!string.IsNullOrEmpty(directory))
-            {
-                Directory.CreateDirectory(directory);
-            }
-
-            File.WriteAllText(Path, JsonSerializer.Serialize(this, Options));
+            lock (_saveLock) SaveLocked();
         }
         catch (Exception)
         {
-            // Settings that cannot be written are settings that keep their defaults.
+            // Keep the previous file and retry on the next change.
+        }
+    }
+
+    private void SaveLocked()
+    {
+        var path = _savePath ?? Path;
+        var text = JsonSerializer.SerializeToUtf8Bytes(this, Options);
+        var migrating = _legacyLosslessUrl is not null || _legacyLosslessSecret is not null;
+        if (migrating)
+        {
+            if (LosslessServer is null && !string.IsNullOrWhiteSpace(_legacyLosslessUrl))
+            {
+                var server = new LosslessServerConfiguration(_legacyLosslessUrl, _legacyLosslessSecret);
+                WriteLosslessCredentials(server);
+                LosslessServer = server;
+            }
+
+            if (_loadedPath is { } original && original != path)
+            {
+                WriteAtomically(original, text);
+            }
+        }
+
+        WriteAtomically(path, text);
+        _legacyLosslessUrl = null;
+        _legacyLosslessSecret = null;
+    }
+
+    private static void WriteAtomically(string path, byte[] text)
+    {
+        var directory = System.IO.Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+
+        var temp = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(text);
+                stream.Flush(flushToDisk: true);
+            }
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            File.Delete(temp);
         }
     }
 
@@ -308,11 +396,12 @@ public sealed class Settings
     /// a file can be read from somewhere else (the old shell-settings.json, or a test).</summary>
     public static Settings Load(string? path = null)
     {
+        var fallback = path is null;
+        var savePath = path ?? Path;
         try
         {
             // The old name is only a fallback for the default path, not for a file asked for.
-            var fallback = path is null;
-            path ??= Path;
+            path = savePath;
             if (!File.Exists(path) && fallback)
             {
                 path = System.IO.Path.Combine(DataPaths.Root, "shell-settings.json");
@@ -320,14 +409,17 @@ public sealed class Settings
 
             if (!File.Exists(path))
             {
-                return new Settings();
+                return new Settings { _savePath = savePath };
             }
 
             var settings = JsonSerializer.Deserialize<Settings>(File.ReadAllText(path), Options);
             if (settings is null)
             {
-                return new Settings();
+                return new Settings { _savePath = savePath };
             }
+
+            settings._savePath = savePath;
+            settings._loadedPath = path;
 
             // Services added in a later version join at the end of a saved order.
             var known = settings.LyricsSourceOrder
@@ -339,7 +431,7 @@ public sealed class Settings
         }
         catch (Exception)
         {
-            return new Settings();
+            return new Settings { _savePath = savePath };
         }
     }
 }

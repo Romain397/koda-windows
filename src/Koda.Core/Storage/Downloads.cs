@@ -185,11 +185,12 @@ public sealed class Downloads : IDisposable
         if (fresh.Length == 0) return;
 
         // Lossless download from the listener's server when they have set one up.
-        if (Settings.Current.UsesLosslessServer)
+        var settings = Settings.Current;
+        if (settings.UsesLosslessServer && settings.LosslessServer is { } server)
         {
             foreach (var song in fresh)
             {
-                _ = Task.Run(() => DownloadLosslessAsync(song));
+                _ = Task.Run(() => DownloadLosslessAsync(song, server));
             }
             return;
         }
@@ -209,7 +210,7 @@ public sealed class Downloads : IDisposable
         RaiseChanged();
     }
 
-    private async Task DownloadLosslessAsync(Song song)
+    private async Task DownloadLosslessAsync(Song song, LosslessServerConfiguration configuration)
     {
         // Already on its way or here.
         lock (_lock)
@@ -234,7 +235,7 @@ public sealed class Downloads : IDisposable
             await _losslessSlots.WaitAsync(cancel.Token).ConfigureAwait(false);
             holdsSlot = true;
 
-            server = new LosslessServer(Settings.Current.LosslessServerUrl!, Settings.Current.LosslessServerSecret);
+            server = new LosslessServer(configuration.Url, configuration.Secret);
             var results = await server.SearchAsync($"{song.Title} {song.ArtistLine}", "hi_res_lossless", cancel.Token)
                 .ConfigureAwait(false);
             if (results.Count == 0)

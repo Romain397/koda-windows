@@ -35,28 +35,81 @@ public class SettingsTests
     public void LosslessDownloadsHaveNoServerUntilOneIsTypedIn()
     {
         var settings = Settings.Load(Path.Combine(Fixtures.Scratch, $"settings-lossless-{Guid.NewGuid():N}.json"));
+        settings.UseLosslessCredentialStore(new TestSecretStore());
 
-        Assert.Null(settings.LosslessServerUrl);
-        Assert.Null(settings.LosslessServerSecret);
+        Assert.Null(settings.LosslessServer);
 
         // Turned on with nowhere to download from, it stays the ordinary download.
         settings.LosslessDownloads = true;
         Assert.False(settings.UsesLosslessServer);
 
-        settings.LosslessServerUrl = "https://example.com/a/token/";
+        settings.ConfigureLosslessServer(new("https://example.com/a/token/", null));
         Assert.True(settings.UsesLosslessServer);
     }
 
     [Theory]
     [InlineData("https://example.com/a/token/", true)]
-    [InlineData("http://192.168.1.4:8080/a/token", true)]
+    [InlineData("http://192.168.1.4:8080/a/token", false)]
+    [InlineData("http://127.0.0.1:8080/a/token", true)]
+    [InlineData("http://[::1]:8080/a/token", true)]
+    [InlineData("https://user:password@example.com/", false)]
     [InlineData("  https://example.com/  ", true)]
     [InlineData("example.com/a/token", false)]
     [InlineData("ftp://example.com/", false)]
     [InlineData("", false)]
     [InlineData(null, false)]
-    public void ALosslessServerIsAnHttpAddress(string? url, bool valid) =>
+    public void ALosslessServerRequiresHttpsOffTheDevice(string? url, bool valid) =>
         Assert.Equal(valid, LosslessServer.IsValidUrl(url));
+
+    [Fact]
+    public void LegacyServerCredentialsAreMigratedAndReloadedFromTheStore()
+    {
+        const string oldSettings = """
+            { "volume": 36, "losslessDownloads": true, "losslessServerUrl": "https://example.com/a/old-token/",
+              "losslessServerSecret": "old-secret" }
+            """;
+        var file = Path.Combine(Fixtures.Scratch, $"settings-migrate-{Guid.NewGuid():N}.json");
+        File.WriteAllText(file, oldSettings);
+        var settings = Settings.Load(file);
+        var secrets = new TestSecretStore { FailWrites = true };
+
+        Assert.Throws<IOException>(() => settings.UseLosslessCredentialStore(secrets));
+        Assert.Equal(oldSettings, File.ReadAllText(file));
+
+        secrets.FailWrites = false;
+        settings.UseLosslessCredentialStore(secrets);
+        var saved = File.ReadAllText(file);
+        Assert.DoesNotContain("old-token", saved);
+        Assert.DoesNotContain("old-secret", saved);
+
+        var restarted = Settings.Load(file);
+        restarted.UseLosslessCredentialStore(secrets);
+        Assert.Equal(36, restarted.Volume);
+        Assert.True(restarted.UsesLosslessServer);
+        Assert.Equal(new LosslessServerConfiguration("https://example.com/a/old-token/", "old-secret"), restarted.LosslessServer);
+    }
+
+    [Fact]
+    public void SavingReplacesTheSettingsFileAndLeavesNoTemporaryFile()
+    {
+        var name = $"settings-save-{Guid.NewGuid():N}.json";
+        var file = Path.Combine(Fixtures.Scratch, name);
+        File.WriteAllText(file, """{ "volume": 42 }""");
+        var settings = Settings.Load(file);
+
+        if (OperatingSystem.IsWindows())
+        {
+            using (File.Open(file, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                settings.Update(s => s.Volume = 76);
+                Assert.Equal(42, Settings.Load(file).Volume);
+            }
+        }
+        settings.Update(s => s.Volume = 82);
+
+        Assert.Equal(82, Settings.Load(file).Volume);
+        Assert.Empty(Directory.EnumerateFiles(Fixtures.Scratch, $"{name}.*.tmp"));
+    }
 
     [Fact]
     public void TheChoicesSurviveASaveAndLoad()

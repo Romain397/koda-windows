@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace Koda.Core;
 
 /// <summary>Google didn't finish a sign-in: the page never set a session's cookies.</summary>
-public sealed class YouTubeSignInException(string message) : Exception(message);
+public sealed class YouTubeSignInException(string message, Exception? inner = null) : Exception(message, inner);
 
 /// <summary>
 /// The library's YouTube Music account: which session signs requests, signing in and out,
@@ -37,6 +37,7 @@ public sealed class YouTubeAccount : IDisposable
     /// <summary>The mirror and the last library snapshot, together: a push reads both.</summary>
     private readonly object _mirrorLock = new();
     private readonly object _syncGate = new();
+    private readonly object _sessionStoreLock = new();
     private readonly HeardThreshold _threshold = new();
     private readonly CancellationTokenSource _stopping = new();
 
@@ -48,6 +49,7 @@ public sealed class YouTubeAccount : IDisposable
     private volatile bool _isSyncing;
     private bool _syncingLibrary;
     private bool _started;
+    private bool _validatingSignIn;
     private int _changeVersion;
     private int _disposed;
 
@@ -113,26 +115,39 @@ public sealed class YouTubeAccount : IDisposable
         await _work.WaitAsync(cancellation);
         try
         {
-            var previous = _music.Accounts.Active?.Cookies;
-            _music.Accounts.SignIn(new AccountSession(AccountId, cookies));
+            YouTubeCookies? previous;
+            lock (_sessionStoreLock)
+            {
+                previous = _music.Accounts.Active?.Cookies;
+                _validatingSignIn = true;
+                _music.Accounts.SignIn(new AccountSession(AccountId, cookies));
+            }
             AccountInfo info;
             try
             {
                 info = await _music.AccountInfoAsync(cancellation);
+                lock (_sessionStoreLock)
+                {
+                    var verified = _music.Accounts.Active!.Cookies;
+                    try
+                    {
+                        _secrets.Write(SerializeCookies(verified));
+                    }
+                    catch (Exception error)
+                    {
+                        throw new YouTubeSignInException("Koda couldn't save the sign-in for next time. Check the Windows Credential Manager and try again.", error);
+                    }
+                    _validatingSignIn = false;
+                }
             }
             catch
             {
-                // The cookies never proved a session: put back what the app had, so a failed
-                // sign-in cannot sign out the account that was working.
-                _music.Accounts.Forget(AccountId);
-                if (previous is not null)
+                // The stored credential is unchanged until the new session is verified and saved.
+                lock (_sessionStoreLock)
                 {
-                    _music.Accounts.Activate(new AccountSession(AccountId, previous));
-                    PersistCookies(previous);
-                }
-                else
-                {
-                    TryWriteSecret(null);
+                    _music.Accounts.Forget(AccountId);
+                    if (previous is not null) _music.Accounts.Activate(new AccountSession(AccountId, previous));
+                    _validatingSignIn = false;
                 }
                 _music.ClearPageCache();
                 throw;
@@ -155,20 +170,38 @@ public sealed class YouTubeAccount : IDisposable
     }
 
     /// <summary>The account is let go; the library stays on this device with everything it holds.</summary>
-    public void SignOut()
+    public async Task SignOutAsync()
     {
-        _music.Accounts.Forget(AccountId);
-        TryWriteSecret(null);
-        _info = null;
-        _isExpired = false;
-        DeleteFile(_infoFile);
-        DeleteFile(_mirrorFile);
-        lock (_mirrorLock)
+        await _work.WaitAsync();
+        try
         {
-            _mirror = new AccountMirror();
-            _lastSeen = Snapshot();
+            lock (_sessionStoreLock)
+            {
+                try
+                {
+                    _secrets.Write(null);
+                }
+                catch (Exception error)
+                {
+                    throw new YouTubeSignInException("Koda couldn't remove the saved sign-in. Check the Windows Credential Manager and try again.", error);
+                }
+                _music.Accounts.Forget(AccountId);
+            }
+            _info = null;
+            _isExpired = false;
+            DeleteFile(_infoFile);
+            DeleteFile(_mirrorFile);
+            lock (_mirrorLock)
+            {
+                _mirror = new AccountMirror();
+                _lastSeen = Snapshot();
+            }
+            _music.ClearPageCache();
         }
-        _music.ClearPageCache();
+        finally
+        {
+            _work.Release();
+        }
         _ = _music.RenewVisitorIdentityAsync();
         Notify();
     }
@@ -195,7 +228,7 @@ public sealed class YouTubeAccount : IDisposable
                 }
             }
 
-            _music.Accounts.Forget(AccountId);
+            lock (_sessionStoreLock) _music.Accounts.Forget(AccountId);
             openLibrary();
 
             _secrets = secrets;
@@ -454,14 +487,15 @@ public sealed class YouTubeAccount : IDisposable
     {
         if (!_threshold.Add(seconds, occurrence, duration)) return;
         if (!_settings.SendsPlaysToYouTube || !_settings.SavesListeningHistory) return;
-        if (_music.Accounts.Active is null || _isExpired) return;
+        if (_music.Accounts.Ticket() is not { } ticket || _isExpired) return;
 
         _ = Task.Run(async () =>
         {
             await _work.WaitAsync();
             try
             {
-                if (_music.Accounts.Active is null || _isExpired || !_settings.SendsPlaysToYouTube) return;
+                if (_music.Accounts.Ticket()?.Generation != ticket.Generation || _isExpired
+                    || !_settings.SendsPlaysToYouTube || !_settings.SavesListeningHistory) return;
                 await _music.ReportPlaybackAsync(videoId, _stopping.Token);
             }
             catch (MusicException e) when (e.Kind == MusicException.Reason.SignedOut)
@@ -483,10 +517,10 @@ public sealed class YouTubeAccount : IDisposable
 
     private void RestoreSession()
     {
-        var stored = _secrets.Read();
-        if (string.IsNullOrEmpty(stored)) return;
         try
         {
+            var stored = _secrets.Read();
+            if (string.IsNullOrEmpty(stored)) return;
             var cookies = JsonSerializer.Deserialize<YouTubeCookies>(stored, AccountJson.Options);
             if (cookies is null || !cookies.LooksSignedIn) return;
             _music.Accounts.Activate(new AccountSession(AccountId, cookies));
@@ -499,27 +533,33 @@ public sealed class YouTubeAccount : IDisposable
         }
     }
 
-    private void PersistCookies(YouTubeCookies cookies) => TryWriteSecret(
-        JsonSerializer.Serialize(cookies, AccountJson.Options));
+    private static string SerializeCookies(YouTubeCookies cookies) => JsonSerializer.Serialize(cookies, AccountJson.Options);
 
-    private void TryWriteSecret(string? value)
+    private void PersistCookies(YouTubeCookies cookies)
     {
-        try
+        lock (_sessionStoreLock)
         {
-            _secrets.Write(value);
-        }
-        catch (Exception)
-        {
-            // A credential the system refused still works this run; the next rotation retries.
+            if (_validatingSignIn || !ReferenceEquals(_music.Accounts.Active?.Cookies, cookies)) return;
+            try
+            {
+                _secrets.Write(SerializeCookies(cookies));
+            }
+            catch (Exception)
+            {
+                // The last saved session is kept. The next rotation can retry the write.
+            }
         }
     }
 
     /// <summary>YouTube's word marks the account as needing sign-in, or clears that again.</summary>
     private void OnVerdict(AccountVerdict verdict)
     {
-        if (verdict.AccountId != AccountId || _music.Accounts.Active is null) return;
-        if (_isExpired == !verdict.SignedIn) return;
-        _isExpired = !verdict.SignedIn;
+        lock (_sessionStoreLock)
+        {
+            if (_validatingSignIn || verdict.AccountId != AccountId
+                || _music.Accounts.SignedIn(AccountId) is not { } signedIn || _isExpired == !signedIn) return;
+            _isExpired = !signedIn;
+        }
         Notify();
         if (!_isExpired) _ = SyncAsync(force: true);
     }

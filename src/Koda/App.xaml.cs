@@ -115,6 +115,21 @@ public partial class App : Application
         Koda.Interop.Startup.Sync();
         Koda.Interop.ProtocolActivation.Register();
 
+        try
+        {
+            Settings.UseLosslessCredentialStore(new Koda.Interop.CredentialStore("Koda/LosslessServer"));
+        }
+        catch (Exception error)
+        {
+            WriteError("Could not load the lossless server credential", error);
+        }
+
+        // Restore the session before the shell starts fetching its first page.
+        var account = Koda.Services.EngineHost.Account;
+        account.Changed += () => Shell?.DispatcherQueue.TryEnqueue(Koda.Services.Profiles.FollowAccount);
+        account.Start();
+        Koda.Services.Profiles.FollowAccount();
+
         Shell = new MainWindow();
         Shell.Activate();
         Koda.Helpers.ShellChrome.ApplyTheme();
@@ -133,12 +148,8 @@ public partial class App : Application
 
         // The YouTube Music account: the saved session signs requests, the library follows the
         // account, and a play heard for a while goes to the account's YouTube history.
-        var account = Koda.Services.EngineHost.Account;
         playback.ItemHeard += (item, seconds) =>
             account.ItemHeard(item.Id, item.Song.Id, item.Song.Duration, seconds);
-        account.Changed += () => Shell?.DispatcherQueue.TryEnqueue(Koda.Services.Profiles.FollowAccount);
-        account.Start();
-        Koda.Services.Profiles.FollowAccount();
 
         // The Discord card follows what plays; it only shows while the listener has it on and
         // listening history is on.

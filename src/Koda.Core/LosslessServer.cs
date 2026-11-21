@@ -7,6 +7,11 @@ using System.Text.RegularExpressions;
 
 namespace Koda.Core;
 
+public sealed record LosslessServerConfiguration(string Url, string? Secret)
+{
+    public override string ToString() => nameof(LosslessServerConfiguration);
+}
+
 /// <summary>
 /// Client for a lossless server the listener points Koda at: it searches the server's
 /// catalogue and downloads a track as FLAC. Nothing about the server is built in; the
@@ -21,16 +26,20 @@ public sealed class LosslessServer : IDisposable
 
     public LosslessServer(string baseUrl, string? secret)
     {
+        if (!IsValidUrl(baseUrl)) throw new ArgumentException("The lossless server address is invalid.", nameof(baseUrl));
         _baseUrl = baseUrl.Trim().TrimEnd('/');
         _secret = secret?.Trim() ?? "";
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+        _http = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
         _http.DefaultRequestHeaders.Add("User-Agent", "Koda/1.0");
     }
 
-    /// <summary>True when the text is an http or https address Koda can use as a server.</summary>
+    /// <summary>Remote servers use HTTPS. Loopback allows a server on the same device.</summary>
     public static bool IsValidUrl(string? url) =>
         Uri.TryCreate(url?.Trim(), UriKind.Absolute, out var uri)
-        && (uri.Scheme == Uri.UriSchemeHttps || uri.Scheme == Uri.UriSchemeHttp);
+        && IsAllowedEndpoint(uri) && uri.Query.Length == 0 && uri.Fragment.Length == 0;
+
+    private static bool IsAllowedEndpoint(Uri uri) => uri.UserInfo.Length == 0
+        && (uri.Scheme == Uri.UriSchemeHttps || (uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback));
 
     private string Token => ExtractToken(_baseUrl);
 
@@ -63,7 +72,7 @@ public sealed class LosslessServer : IDisposable
             req.Headers.Add("X-LW-Sign", sign);
             req.Headers.Add("X-LW-Intent", "stream");
         }
-        var resp = await _http.SendAsync(req, ct);
+        using var resp = await _http.SendAsync(req, ct);
         resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadAsStringAsync(ct);
     }
@@ -111,6 +120,24 @@ public sealed class LosslessServer : IDisposable
         return null;
     }
 
+    private async Task<HttpResponseMessage> GetMediaAsync(Uri uri, CancellationToken cancellation)
+    {
+        // A CDN may redirect a media request. Validate every hop before sending it.
+        for (var redirects = 0; redirects <= 5; redirects++)
+        {
+            if (!IsAllowedEndpoint(uri)) throw new InvalidOperationException("An insecure media address was refused.");
+            var response = await _http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellation);
+            if ((int)response.StatusCode is not (301 or 302 or 303 or 307 or 308)
+                || response.Headers.Location is not { } location)
+            {
+                return response;
+            }
+            response.Dispose();
+            uri = new Uri(uri, location);
+        }
+        throw new InvalidOperationException("Too many media redirects.");
+    }
+
     /// <summary>Download a track as FLAC. Returns the file path.</summary>
     public async Task<string> DownloadAsync(string trackId, string outputPath, IProgress<double>? progress = null, CancellationToken ct = default)
     {
@@ -119,7 +146,8 @@ public sealed class LosslessServer : IDisposable
             throw new InvalidOperationException("No stream URL returned");
 
         // The stream URL is a DASH manifest, or (from some servers) the file itself.
-        using var mpdResp = await _http.GetAsync(mpdUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+        var manifestUri = new Uri(mpdUrl);
+        using var mpdResp = await GetMediaAsync(manifestUri, ct);
         mpdResp.EnsureSuccessStatusCode();
         var mediaType = mpdResp.Content.Headers.ContentType?.MediaType ?? "";
         if (mediaType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase)
@@ -139,8 +167,8 @@ public sealed class LosslessServer : IDisposable
         if (!initMatch.Success || !mediaMatch.Success)
             throw new InvalidOperationException("Could not parse DASH manifest");
 
-        var baseUri = new Uri(mpdUrl);
-        var initUrl = new Uri(baseUri, WebUtility.HtmlDecode(initMatch.Groups[1].Value)).AbsoluteUri;
+        var baseUri = mpdResp.RequestMessage?.RequestUri ?? manifestUri;
+        var initUrl = new Uri(baseUri, WebUtility.HtmlDecode(initMatch.Groups[1].Value));
         var mediaTemplate = new Uri(baseUri, WebUtility.HtmlDecode(mediaMatch.Groups[1].Value)).AbsoluteUri;
 
         // Parse duration. The manifest's numbers are invariant: "12.5", never "12,5".
@@ -165,8 +193,11 @@ public sealed class LosslessServer : IDisposable
 
         // Written as it comes rather than held whole in memory.
         await using var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None);
-        var initBytes = await _http.GetByteArrayAsync(initUrl, ct);
-        await output.WriteAsync(initBytes, ct);
+        using (var init = await GetMediaAsync(initUrl, ct))
+        {
+            init.EnsureSuccessStatusCode();
+            await init.Content.CopyToAsync(output, ct);
+        }
 
         // The duration's rounding can promise one segment more than there is: only a
         // missing segment past the expected count ends the song. Earlier, it is a failure,
@@ -175,7 +206,7 @@ public sealed class LosslessServer : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             var segUrl = mediaTemplate.Replace("$Number$", i.ToString(invariant));
-            using var seg = await _http.GetAsync(segUrl, HttpCompletionOption.ResponseHeadersRead, ct);
+            using var seg = await GetMediaAsync(new Uri(segUrl), ct);
             if (!seg.IsSuccessStatusCode)
             {
                 if (i >= expected) break;

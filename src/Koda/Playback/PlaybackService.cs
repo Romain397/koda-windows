@@ -60,6 +60,10 @@ public sealed class PlaybackService
     /// <summary>Bumped per play of a song (a repeat round included), so a slow resolve for a song
     /// skipped past is dropped and each play is reported once.</summary>
     private int _generation;
+    private Guid? _listeningItem;
+    private Guid _listeningProfile;
+
+    private bool IsListeningProfile => !Profiles.IsSwitching && _listeningProfile == Profiles.Roster.ActiveId;
     /// <summary>Bumped per load ahead, so a slow resolve for a next song that changed is dropped.</summary>
     private int _nextGeneration;
     private int _reportedGeneration = -1;
@@ -193,8 +197,11 @@ public sealed class PlaybackService
         var sounding = _player.State == MediaPlayerState.Playing;
         if (_queue.Current is { } item && sounding)
         {
-            App.Library.AddListening(0.5, item.Song);
-            ItemHeard?.Invoke(item, 0.5);
+            if (IsListeningProfile && _listeningItem == item.Id)
+            {
+                App.Library.AddListening(0.5, item.Song);
+                ItemHeard?.Invoke(item, 0.5);
+            }
 
             // A retried song that has played well for a while has earned another retry: a
             // stall much later in a long song is a new problem, not the same one again.
@@ -700,6 +707,7 @@ public sealed class PlaybackService
         }
 
         var song = item.Song;
+        if (_listeningItem != item.Id) SetListeningProfile(item);
         var generation = ++_generation;
         // The old song leaves now, not when the new one has resolved: a skip is heard at once.
         var fadeIn = fade && _player.FadesSkips ? Player.SkipFadeSeconds : 0;
@@ -765,8 +773,11 @@ public sealed class PlaybackService
     /// <summary>What every new play of a song does once its audio is in the player.</summary>
     private void BeganSong(Song song)
     {
-        App.Library.RecordPlay(song);
-        App.Library.Flush(); // the listening time of the finished song is on disk now
+        if (IsListeningProfile)
+        {
+            App.Library.RecordPlay(song);
+            App.Library.Flush(); // the listening time of the finished song is on disk now
+        }
         TrackChanged?.Invoke(); // the exact duration is known now
         PlayStateChanged?.Invoke();
         Koda.Services.LyricsService.Prefetch(song); // the words are ready before anyone asks
@@ -784,6 +795,7 @@ public sealed class PlaybackService
             return;
         }
 
+        SetListeningProfile(item);
         ++_generation;
         _currentStream = _player.Stream;
         _loaded = true;
@@ -815,7 +827,13 @@ public sealed class PlaybackService
         }
 
         _reportedGeneration = _generation;
-        ItemStarted?.Invoke(item);
+        if (IsListeningProfile && _listeningItem == item.Id) ItemStarted?.Invoke(item);
+    }
+
+    private void SetListeningProfile(QueueItem item)
+    {
+        _listeningItem = item.Id;
+        _listeningProfile = Profiles.IsSwitching ? Guid.Empty : Profiles.Roster.ActiveId;
     }
 
     /// <summary>Keep the song that plays next loaded on standby, once the current one is near its
@@ -995,6 +1013,7 @@ public sealed class PlaybackService
                 // Repeat one with nothing waiting: the same song again, already loaded. It is
                 // a new play for history and Last.fm.
                 ++_generation;
+                SetListeningProfile(next);
                 _player.Seek(0);
                 _player.Play();
                 BeganSong(next.Song);

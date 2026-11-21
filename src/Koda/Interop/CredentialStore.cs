@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using Koda.Core;
@@ -24,35 +25,33 @@ internal sealed class CredentialStore(string target) : ISecretStore
     /// <summary>What one credential may hold, with room under the API's 2560-byte blob limit.</summary>
     private const int ChunkBytes = 2000;
 
-    private const string ChunkPrefix = "koda-chunks:1:";
+    private const string LegacyChunkPrefix = "koda-chunks:1:";
+    private const string ChunkPrefix = "koda-chunks:2:";
     private const int MaxChunks = 64;
 
     /// <summary>Rotations from requests in flight together all write the same target; the
     /// manifest and its chunks must change as one.</summary>
-    private readonly object _gate = new();
+    private static readonly object Gate = new();
 
     public string? Read()
     {
-        lock (_gate) return ReadLocked();
+        lock (Gate) return ReadLocked();
     }
 
     private string? ReadLocked()
     {
         var value = ReadRaw(target);
-        if (value is null || !value.StartsWith(ChunkPrefix, StringComparison.Ordinal))
+        if (value is null) return null;
+        if (!TryReadManifest(value, out var slot, out var count))
         {
-            return value;
-        }
-
-        if (!int.TryParse(value.AsSpan(ChunkPrefix.Length), out var count) || count is < 1 or > MaxChunks)
-        {
-            return null;
+            return value.StartsWith(LegacyChunkPrefix, StringComparison.Ordinal)
+                || value.StartsWith(ChunkPrefix, StringComparison.Ordinal) ? null : value;
         }
 
         var parts = new string[count];
         for (var index = 0; index < count; index++)
         {
-            if (ReadRaw(ChunkTarget(index)) is not { } part)
+            if (ReadRaw(ChunkTarget(slot, index)) is not { } part)
             {
                 return null;
             }
@@ -63,18 +62,18 @@ internal sealed class CredentialStore(string target) : ISecretStore
 
     public void Write(string? value)
     {
-        lock (_gate) WriteLocked(value);
+        lock (Gate) WriteLocked(value);
     }
 
     private void WriteLocked(string? value)
     {
+        var hasPrevious = TryReadManifest(ReadRaw(target), out var previousSlot, out var previousCount);
         if (value is null)
         {
             DeleteRaw(target);
-            for (var index = 0; index < MaxChunks; index++)
-            {
-                if (!DeleteRaw(ChunkTarget(index))) break;
-            }
+            CleanChunks('a', MaxChunks);
+            CleanChunks('b', MaxChunks);
+            CleanChunks('\0', MaxChunks);
             return;
         }
 
@@ -84,23 +83,61 @@ internal sealed class CredentialStore(string target) : ISecretStore
             throw new InvalidOperationException("The sign-in is too large to keep.");
         }
 
-        var chunked = chunks.Count > 1;
-        if (chunked)
+        if (chunks.Count == 1)
         {
-            for (var index = 0; index < chunks.Count; index++)
+            WriteRaw(target, value);
+        }
+        else
+        {
+            // Write to the unused slot, then commit the new version with one credential write.
+            var slot = previousSlot == 'a' ? 'b' : 'a';
+            try
             {
-                WriteRaw(ChunkTarget(index), chunks[index]);
+                for (var index = 0; index < chunks.Count; index++)
+                {
+                    WriteRaw(ChunkTarget(slot, index), chunks[index]);
+                }
+                WriteRaw(target, $"{ChunkPrefix}{slot}:{chunks.Count}");
+            }
+            catch
+            {
+                CleanChunks(slot, chunks.Count);
+                throw;
             }
         }
 
-        // The manifest is written last: a crash mid-write never points at chunks that aren't there.
-        WriteRaw(target, chunked ? ChunkPrefix + chunks.Count : value);
+        if (hasPrevious) CleanChunks(previousSlot, previousCount);
+    }
 
-        // A value shorter than last time leaves no stale chunks behind; a single-chunk value
-        // wrote none, so any chunk credentials from before are stale from index zero.
-        for (var index = chunked ? chunks.Count : 0; index < MaxChunks; index++)
+    private static bool TryReadManifest(string? value, out char slot, out int count)
+    {
+        slot = '\0';
+        count = 0;
+        if (value?.StartsWith(LegacyChunkPrefix, StringComparison.Ordinal) == true)
         {
-            if (!DeleteRaw(ChunkTarget(index))) break;
+            return int.TryParse(value.AsSpan(LegacyChunkPrefix.Length), out count) && count is >= 1 and <= MaxChunks;
+        }
+        if (value?.StartsWith(ChunkPrefix, StringComparison.Ordinal) != true) return false;
+
+        var manifest = value.AsSpan(ChunkPrefix.Length);
+        if (manifest.Length < 3 || manifest[0] is not ('a' or 'b') || manifest[1] != ':') return false;
+        if (!int.TryParse(manifest[2..], out count) || count is < 1 or > MaxChunks) return false;
+        slot = manifest[0];
+        return true;
+    }
+
+    private void CleanChunks(char slot, int count)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            try
+            {
+                DeleteRaw(ChunkTarget(slot, index));
+            }
+            catch (InvalidOperationException)
+            {
+                // The active credential no longer points at this slot.
+            }
         }
     }
 
@@ -137,13 +174,15 @@ internal sealed class CredentialStore(string target) : ISecretStore
         return chunks;
     }
 
-    private string ChunkTarget(int index) => $"{target}#{index}";
+    private string ChunkTarget(char slot, int index) => slot == '\0' ? $"{target}#{index}" : $"{target}#{slot}{index}";
 
     private static string? ReadRaw(string name)
     {
         if (!CredRead(name, GenericType, 0, out var pointer))
         {
-            return null;
+            var error = Marshal.GetLastWin32Error();
+            if (error == NotFound) return null;
+            throw new InvalidOperationException("Windows couldn't read the saved credential.", new Win32Exception(error));
         }
 
         try
@@ -182,7 +221,7 @@ internal sealed class CredentialStore(string target) : ISecretStore
             };
             if (!CredWrite(ref credential, 0))
             {
-                throw new InvalidOperationException("Windows refused to keep the sign-in.");
+                throw new InvalidOperationException("Windows couldn't save the credential.", new Win32Exception(Marshal.GetLastWin32Error()));
             }
         }
         finally
@@ -193,17 +232,12 @@ internal sealed class CredentialStore(string target) : ISecretStore
         }
     }
 
-    private static bool DeleteRaw(string name)
+    private static void DeleteRaw(string name)
     {
-        if (CredDelete(name, GenericType, 0))
-        {
-            return true;
-        }
-        if (Marshal.GetLastWin32Error() == NotFound)
-        {
-            return false;
-        }
-        throw new InvalidOperationException("The saved sign-in couldn't be removed.");
+        if (CredDelete(name, GenericType, 0)) return;
+        var error = Marshal.GetLastWin32Error();
+        if (error == NotFound) return;
+        throw new InvalidOperationException("Windows couldn't remove the saved credential.", new Win32Exception(error));
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

@@ -594,7 +594,7 @@ public sealed partial class SettingsPage : Page
         var on = LosslessDownloadsSwitch.IsOn;
 
         // Turning it on with no server yet asks for one; backing out leaves it off.
-        if (on && string.IsNullOrWhiteSpace(App.Settings.LosslessServerUrl)
+        if (on && !LosslessServer.IsValidUrl(App.Settings.LosslessServer?.Url)
             && !await AskLosslessServerAsync())
         {
             _loaded = false;
@@ -618,29 +618,43 @@ public sealed partial class SettingsPage : Page
     /// <summary>Asks for the server's address and secret; true when they were saved.</summary>
     private async Task<bool> AskLosslessServerAsync()
     {
-        var server = await Dialogs.AskLosslessServerAsync(
-            App.Settings.LosslessServerUrl, App.Settings.LosslessServerSecret);
+        var current = App.Settings.LosslessServer;
+        var server = await Dialogs.AskLosslessServerAsync(current?.Url, current?.Secret);
         if (server is not { } chosen)
         {
             return false;
         }
 
-        App.Settings.Update(s =>
+        try
         {
-            s.LosslessServerUrl = chosen.Url;
-            s.LosslessServerSecret = chosen.Secret.Length > 0 ? chosen.Secret : null;
-        });
+            App.Settings.ConfigureLosslessServer(new(chosen.Url, chosen.Secret.Length > 0 ? chosen.Secret : null));
+        }
+        catch (Exception)
+        {
+            Notice("Windows couldn't save the lossless server credentials. Try again.");
+            return false;
+        }
         RefreshLosslessServer();
         return true;
     }
 
     private void RefreshLosslessServer()
     {
-        var url = App.Settings.LosslessServerUrl;
-        var hasServer = !string.IsNullOrWhiteSpace(url);
-        LosslessServerText.Text = hasServer && Uri.TryCreate(url, UriKind.Absolute, out var uri)
-            ? (App.Settings.LosslessServerSecret is { Length: > 0 } ? $"{uri.Host}, signed" : uri.Host)
-            : "Not set up. Lossless downloads need the address of a server to take them from.";
+        var server = App.Settings.LosslessServer;
+        var hasServer = server is not null;
+        if (server is null)
+        {
+            LosslessServerText.Text = "Not set up. Lossless downloads need the address of a server to take them from.";
+        }
+        else if (!LosslessServer.IsValidUrl(server.Url))
+        {
+            LosslessServerText.Text = "Update the server address to use HTTPS.";
+        }
+        else
+        {
+            var host = new Uri(server.Url).Host;
+            LosslessServerText.Text = server.Secret is { Length: > 0 } ? $"{host}, signed" : host;
+        }
         LosslessServerButton.Content = hasServer ? "Change…" : "Set up…";
         AutomationProperties.SetName(LosslessServerButton,
             hasServer ? "Change lossless server" : "Set up lossless server");
@@ -967,8 +981,15 @@ public sealed partial class SettingsPage : Page
                 "The library stays on this PC with its likes, playlists and history. Your YouTube Music account isn't affected.",
                 "Sign Out"))
         {
-            App.Account.SignOut();
-            Notice("Signed out of YouTube Music. The library is still here.");
+            try
+            {
+                await App.Account.SignOutAsync();
+                Notice("Signed out of YouTube Music. The library is still here.");
+            }
+            catch (YouTubeSignInException error)
+            {
+                Notice(error.Message);
+            }
         }
     }
 

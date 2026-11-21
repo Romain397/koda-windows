@@ -76,7 +76,7 @@ public static class Dialogs
     }
 
     /// <summary>Asks for the lossless server's address and, if it signs requests, its secret.
-    /// Null when the listener backed out; the address must be an http or https URL.</summary>
+    /// Null when the listener backed out. Remote servers require HTTPS.</summary>
     public static async Task<(string Url, string Secret)?> AskLosslessServerAsync(string? url, string? secret)
     {
         var caption = (Style)Application.Current.Resources["CaptionTextBlockStyle"];
@@ -100,7 +100,7 @@ public static class Dialogs
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(secretBox, "Secret");
         var problem = new TextBlock
         {
-            Text = "Enter the full address, starting with https://.",
+            Text = "Enter an HTTPS address. HTTP is only supported for a server on this PC.",
             Style = caption,
             Foreground = (Microsoft.UI.Xaml.Media.Brush)Application.Current.Resources["SystemFillColorCriticalBrush"],
             Visibility = Visibility.Collapsed,

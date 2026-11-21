@@ -87,20 +87,25 @@ public sealed class YouTubeCookies : IEquatable<YouTubeCookies>
 
     public string? this[string name] => _cookies.FirstOrDefault(c => c.Name == name)?.Value;
 
+    [JsonIgnore]
     public bool IsEmpty => _cookies.Count == 0;
 
     /// <summary>The <c>Cookie</c> request header.</summary>
+    [JsonIgnore]
     public string Header => string.Join("; ", _cookies.Select(c => $"{c.Name}={c.Value}"));
 
     /// <summary>The secret requests are signed with. YouTube hands the same value out under
     /// the legacy name and its partitioned twin, so a jar missing one usually has the other.</summary>
+    [JsonIgnore]
     public string? Sapisid => this["SAPISID"] ?? this["__Secure-3PAPISID"];
 
     /// <summary>Has what a signed-in session can't work without: a SAPISID to sign with and
     /// the SID session itself.</summary>
+    [JsonIgnore]
     public bool LooksSignedIn => Sapisid is not null && this["SID"] is not null;
 
     /// <summary>The five cookies Google sets when the browser is really signed in.</summary>
+    [JsonIgnore]
     public bool HasSignInCookies => RequiredNames.All(name => this[name] is not null);
 
     // MARK: Rotation

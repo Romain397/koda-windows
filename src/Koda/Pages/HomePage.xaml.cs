@@ -29,9 +29,9 @@ public sealed partial class HomePage : Page
 
     private sealed record Saved(
         Mix? Mix, Song[] Picks, bool PicksPersonal, PlaylistSummary[] Charts, Song[] Trending,
-        Shelf[] YouTube, Dictionary<string, Artwork> ArtistPhotos, DateTimeOffset LoadedAt);
+        Shelf[] YouTube, Dictionary<string, Artwork> ArtistPhotos, DateTimeOffset LoadedAt, int Version);
 
-    private static string SnapshotPath => Path.Combine(Koda.Services.Profiles.ActiveFolder, "home-snapshot.json");
+    private const int SnapshotVersion = 1;
     private static readonly JsonSerializerOptions SnapshotJson = new() { PropertyNameCaseInsensitive = true };
 
     private Saved? _state;
@@ -57,7 +57,7 @@ public sealed partial class HomePage : Page
             _ => "Up late",
         };
 
-        _state ??= ReadSnapshot();
+        _state ??= ReadSnapshot(Path.Combine(Profiles.ActiveFolder, "home-snapshot.json"));
         if (_state is not null)
         {
             Show(_state);
@@ -78,10 +78,17 @@ public sealed partial class HomePage : Page
 
     private async Task RefreshAsync()
     {
-        if (_loading)
+        if (_loading || Profiles.IsSwitching)
         {
             return;
         }
+
+        var version = Profiles.HomeVersion;
+        var snapshotPath = Path.Combine(Profiles.ActiveFolder, "home-snapshot.json");
+        var music = EngineHost.Music;
+        var accountScope = music.Accounts.CacheScope;
+        bool StillCurrent() => version == Profiles.HomeVersion && !Profiles.IsSwitching
+            && accountScope == music.Accounts.CacheScope;
 
         _loading = true;
         RefreshButton.IsEnabled = false;
@@ -94,7 +101,6 @@ public sealed partial class HomePage : Page
             SkeletonHost.Content = Skeletons.Shelves(2);
         }
 
-        var music = EngineHost.Music;
         var library = App.Library;
         var recent = library.Recent;
         var taste = Taste.From(library);
@@ -105,6 +111,7 @@ public sealed partial class HomePage : Page
             var charts = Try(music.ChartPlaylistsAsync());
             var picks = QuickPicksAsync(recent);
             await Task.WhenAll(explore, home, charts, picks);
+            if (!StillCurrent()) return;
             if (explore.Result is null && home.Result is null && picks.Result.Length == 0)
             {
                 throw MusicException.Network("home");
@@ -115,7 +122,7 @@ public sealed partial class HomePage : Page
                 (explore.Result?.Shelves ?? []).Where(s => s.Title != "Trending")).ToArray();
             var personal = picks.Result.Length > 0;
             var state = new Saved(_state?.Mix, personal ? picks.Result : trending, personal, charts.Result ?? [],
-                trending, DedupeShelves(youtube), _state?.ArtistPhotos ?? [], DateTimeOffset.Now);
+                trending, DedupeShelves(youtube), _state?.ArtistPhotos ?? [], DateTimeOffset.Now, SnapshotVersion);
             if (state.Mix is null && taste.IsEmpty && trending.Length > 0)
             {
                 state = state with { Mix = StartHere(trending) };
@@ -127,17 +134,20 @@ public sealed partial class HomePage : Page
 
             // The mix and the artist photos come after the page is up.
             var mix = await BuildMixAsync(taste, recent);
+            if (!StillCurrent()) return;
             var photos = await ArtistPhotosAsync(state.ArtistPhotos);
+            if (!StillCurrent()) return;
             _state = _state with
             {
                 Mix = mix ?? _state.Mix ?? (trending.Length > 0 ? StartHere(trending) : null),
                 ArtistPhotos = photos,
             };
             Show(_state);
-            WriteSnapshot(_state);
+            WriteSnapshot(snapshotPath, _state);
         }
         catch (Exception error)
         {
+            if (!StillCurrent()) return;
             if (hadContent)
             {
                 App.Shell?.Note($"Home didn't refresh. {Errors.Describe(error)}");
@@ -433,15 +443,16 @@ public sealed partial class HomePage : Page
 
     // MARK: snapshot
 
-    private static Saved? ReadSnapshot()
+    private static Saved? ReadSnapshot(string path)
     {
         try
         {
-            var saved = File.Exists(SnapshotPath)
-                ? JsonSerializer.Deserialize<Saved>(File.ReadAllText(SnapshotPath), SnapshotJson)
+            var saved = File.Exists(path)
+                ? JsonSerializer.Deserialize<Saved>(File.ReadAllText(path), SnapshotJson)
                 : null;
-            // A snapshot from an older Home lacks these; it is ignored rather than half-drawn.
-            return saved is { Picks: not null, Charts: not null, Trending: not null, YouTube: not null, ArtistPhotos: not null }
+            // Older snapshots could have been written by a refresh from a different profile.
+            return saved is { Version: SnapshotVersion, Picks: not null, Charts: not null, Trending: not null,
+                YouTube: not null, ArtistPhotos: not null }
                 ? saved
                 : null;
         }
@@ -451,11 +462,11 @@ public sealed partial class HomePage : Page
         }
     }
 
-    private static void WriteSnapshot(Saved state)
+    private static void WriteSnapshot(string path, Saved state)
     {
         try
         {
-            File.WriteAllText(SnapshotPath, JsonSerializer.Serialize(state, SnapshotJson));
+            File.WriteAllText(path, JsonSerializer.Serialize(state, SnapshotJson));
         }
         catch (Exception)
         {
