@@ -187,21 +187,32 @@ public sealed partial class YouTubeMusic : IDisposable
     /// <summary>The next page of a playlist's tracks.</summary>
     public async Task<PlaylistTrackPage> PlaylistMoreAsync(string continuation, CancellationToken cancellation = default)
     {
-        var root = await _api.MusicAsync("browse",
-            new JsonObject { ["continuation"] = continuation }, cancellation);
-        var next = Pages.PlaylistContinuation(root);
-        return new PlaylistTrackPage(Pages.PlaylistTracks(root), next == continuation ? null : next);
+        var root = await FetchPlaylistContinuationAsync(continuation, cancellation);
+        return new PlaylistTrackPage(Pages.PlaylistTracks(root), Pages.PlaylistContinuation(root));
     }
 
-    /// <summary>Every track of a playlist, following continuations.</summary>
-    public async Task<Song[]> PlaylistSongsAsync(string browseId, int limit = 1000, CancellationToken cancellation = default)
+    private async Task<Json> FetchPlaylistContinuationAsync(string continuation, CancellationToken cancellation,
+        Signing signing = Signing.IfSignedIn)
+    {
+        var root = await _api.MusicAsync("browse", new JsonObject { ["continuation"] = continuation }, cancellation, signing);
+        return Pages.HasPlaylistShelf(root) ? root : throw MusicException.BadResponse(200);
+    }
+
+    /// <summary>Read the playlist's tracks. A null limit requires reaching the last page.</summary>
+    public async Task<Song[]> PlaylistSongsAsync(string browseId, int? limit = 1000, CancellationToken cancellation = default)
     {
         var root = await _api.MusicAsync("browse", new JsonObject { ["browseId"] = browseId }, cancellation);
+        if (limit is null && !Pages.HasPlaylistShelf(root)) throw MusicException.BadResponse(200);
         var songs = new List<Song>(Pages.PlaylistSongs(root));
         var token = Pages.PlaylistContinuation(root);
         var seen = new HashSet<string>();
-        while (token is { } current && songs.Count < limit && seen.Add(current))
+        while (token is { } current && (limit is null || songs.Count < limit.Value))
         {
+            if (!seen.Add(current))
+            {
+                if (limit is null) throw MusicException.BadResponse(200);
+                break;
+            }
             var page = await PlaylistMoreAsync(current, cancellation);
             songs.AddRange(page.Tracks.Select(track => track.Song));
             token = page.Continuation;

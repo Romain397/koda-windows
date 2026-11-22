@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Koda.Core;
 using Microsoft.UI.Xaml;
@@ -95,8 +96,11 @@ public static class Dialogs
             list.SelectionChanged += (_, _) => dialog.IsPrimaryButtonEnabled = list.SelectedItem is PlaylistSummary;
             if (await ShowAsync(dialog) != ContentDialogResult.Primary || list.SelectedItem is not PlaylistSummary playlist) return;
 
-            await App.Account.AddPlaylistSongsAsync(session, playlist.Id, songs);
-            App.Shell?.Note($"Updated {playlist.Title} on YouTube Music.");
+            var added = await App.Account.AddPlaylistSongsAsync(session, playlist.Id, songs);
+            var requested = songs.Select(song => song.Id).Distinct().Count();
+            App.Shell?.Note(added == 0 ? $"Already in {playlist.Title}."
+                : added == requested ? $"Updated {playlist.Title} on YouTube Music."
+                : $"Added {added} songs to {playlist.Title}. Skipped songs already there.");
         }
         catch (Exception error)
         {

@@ -352,24 +352,24 @@ public static class Pages
 
     public static Song[] PlaylistSongs(Json root) => [.. PlaylistTracks(root).Select(track => track.Song)];
 
-    internal static PlaylistTrack[] PlaylistTracks(Json root)
-    {
-        var containers = root.Objects("musicPlaylistShelfRenderer")
-            .Concat(root.Objects("musicPlaylistShelfContinuation"))
-            .Concat(root.Objects("appendContinuationItemsAction"));
-        var tracks = new List<PlaylistTrack>();
-        foreach (var container in containers)
-        {
-            var entries = container["contents"].Array.Concat(container["continuationItems"].Array);
-            foreach (var entry in entries)
-            {
-                var row = entry["musicResponsiveListItemRenderer"];
-                if (Rows.SongFromListRow(row) is { } song)
-                    tracks.Add(new PlaylistTrack(song, row["playlistItemData"]["playlistSetVideoId"].NonEmpty));
-            }
-        }
-        return [.. tracks];
-    }
+    private static IEnumerable<Json> PlaylistShelves(Json root) => root.Objects("musicPlaylistShelfRenderer")
+        .Concat(root.Objects("musicPlaylistShelfContinuation"))
+        .Concat(root.Objects("appendContinuationItemsAction"));
+
+    internal static bool HasPlaylistShelf(Json root) => PlaylistShelves(root).Any();
+
+    private static IEnumerable<Json> PlaylistRows(Json root) => PlaylistShelves(root)
+        .SelectMany(shelf => shelf["contents"].Array.Concat(shelf["continuationItems"].Array))
+        .Select(entry => entry["musicResponsiveListItemRenderer"]).Where(row => row.Exists);
+
+    internal static IEnumerable<string> PlaylistVideoIds(Json root) => PlaylistRows(root)
+        .Select(row => row["playlistItemData"]["videoId"].NonEmpty ?? Rows.SongFromListRow(row)?.Id)
+        .OfType<string>();
+
+    internal static PlaylistTrack[] PlaylistTracks(Json root) => [.. PlaylistRows(root)
+        .Select(row => Rows.SongFromListRow(row) is { } song
+            ? new PlaylistTrack(song, row["playlistItemData"]["playlistSetVideoId"].NonEmpty) : null)
+        .OfType<PlaylistTrack>()];
 
     /// <summary>
     /// Only the track shelf's token: a playlist page also carries a section
@@ -377,10 +377,7 @@ public static class Pages
     /// </summary>
     public static string? PlaylistContinuation(Json root)
     {
-        var scopes = root.Objects("musicPlaylistShelfRenderer")
-            .Concat(root.Objects("musicPlaylistShelfContinuation"))
-            .Concat(root.Objects("appendContinuationItemsAction"));
-        foreach (var scope in scopes)
+        foreach (var scope in PlaylistShelves(root))
         {
             var command = scope.Objects("continuationCommand");
             if (command.Length > 0 && command[0]["token"].NonEmpty is { } token) return token;

@@ -922,9 +922,11 @@ public sealed class Library
             var playlists = 0;
             foreach (var playlist in backup.Playlists)
             {
-                var ids = playlist.Songs.Select(x => x.Id).ToArray();
-                if (s.UserPlaylists.Exists(p => p.Name == playlist.Name && p.Songs.Select(x => x.Id).SequenceEqual(ids))) continue;
-                s.UserPlaylists.Add(global::Koda.Core.UserPlaylist.Create(playlist.Name, playlist.Songs, playlist.Created));
+                var songs = Unique(playlist.Songs);
+                var ids = songs.Select(x => x.Id);
+                if (s.UserPlaylists.Exists(p => p.Name == playlist.Name
+                    && p.Songs.Select(x => x.Id).Distinct(StringComparer.Ordinal).SequenceEqual(ids))) continue;
+                s.UserPlaylists.Add(global::Koda.Core.UserPlaylist.Create(playlist.Name, songs, playlist.Created));
                 playlists++;
             }
             s.UserPlaylists = [.. s.UserPlaylists.OrderByDescending(p => p.Created)];

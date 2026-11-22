@@ -425,7 +425,10 @@ public sealed partial class MainWindow : Window
                 NavigateRoot(typeof(UserPlaylistPage), id, tag);
                 break;
             case not null when tag.StartsWith("yt-playlist:", StringComparison.Ordinal):
-                NavigateRoot(typeof(PlaylistPage), tag["yt-playlist:".Length..], tag);
+                var playlistId = tag["yt-playlist:".Length..];
+                var pin = App.Library.PinnedPlaylists.FirstOrDefault(p => !p.IsLocal && p.Id == playlistId);
+                NavigateRoot(typeof(PlaylistPage), new PlaylistPage.PlaylistRequest(playlistId, pin?.Title ?? "Songs",
+                    null, pin?.Artwork, LoadAll: true), tag);
                 break;
         }
     }

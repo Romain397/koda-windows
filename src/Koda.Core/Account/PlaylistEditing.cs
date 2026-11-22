@@ -29,16 +29,33 @@ public sealed partial class YouTubeMusic
         return [.. playlists.DistinctBy(playlist => playlist.Id)];
     }
 
-    internal async Task AddPlaylistSongsAsync(string id, IReadOnlyList<Song> songs, CancellationToken cancellation)
+    internal async Task<int> AddPlaylistSongsAsync(string id, IReadOnlyList<Song> songs, CancellationToken cancellation)
     {
+        id = Pages.PlaylistId(id);
+        if (!Pages.IsEditablePlaylistId(id)) throw new InvalidOperationException("This playlist can't be edited.");
+        var requested = songs.Select(song => song.Id).Distinct(StringComparer.Ordinal).ToArray();
+        if (requested.Length == 0) return 0;
+
+        var pending = requested.ToHashSet(StringComparer.Ordinal);
+        var root = await _api.MusicAsync("browse", new JsonObject { ["browseId"] = "VL" + id }, cancellation, Signing.Required);
+        if (!Pages.HasPlaylistShelf(root) && Pages.Playlist(root, id) is null) throw MusicException.BadResponse(200);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        while (true)
+        {
+            pending.ExceptWith(Pages.PlaylistVideoIds(root));
+            if (pending.Count == 0 || Pages.PlaylistContinuation(root) is not { } token) break;
+            if (!seen.Add(token)) throw MusicException.BadResponse(200);
+            root = await FetchPlaylistContinuationAsync(token, cancellation, Signing.Required);
+        }
+
         var sent = 0;
-        foreach (var batch in songs.Select(song => song.Id).Distinct().Chunk(50))
+        // Keep YouTube's duplicate check enabled in case another device adds a song after this read.
+        foreach (var batch in requested.Where(pending.Contains).Chunk(50))
         {
             var actions = new JsonArray([.. batch.Select(videoId => new JsonObject
             {
                 ["action"] = "ACTION_ADD_VIDEO",
                 ["addedVideoId"] = videoId,
-                ["dedupeOption"] = "DEDUPE_OPTION_SKIP",
             })]);
             try
             {
@@ -50,6 +67,7 @@ public sealed partial class YouTubeMusic
             }
             sent += batch.Length;
         }
+        return sent;
     }
 
     internal Task RemovePlaylistTrackAsync(string id, string videoId, string setVideoId, CancellationToken cancellation) =>

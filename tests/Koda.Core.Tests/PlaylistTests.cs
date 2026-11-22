@@ -71,7 +71,7 @@ public class PlaylistTests
 
         var playlists = await account.EditablePlaylistsAsync(session, song.Id);
         Assert.Equal("PLowned", Assert.Single(playlists).Id);
-        await account.AddPlaylistSongsAsync(session, "VLPLowned", [song, song]);
+        Assert.Equal(1, await account.AddPlaylistSongsAsync(session, "VLPLowned", [song, song]));
         await account.RemovePlaylistTrackAsync(session, "PLowned", song.Id, "occurrence-2");
         await account.MovePlaylistTrackAsync(session, "PLowned", "occurrence-1", "occurrence-3");
         await account.RenamePlaylistAsync(session, "PLowned", "Changed");
@@ -79,7 +79,7 @@ public class PlaylistTests
         Assert.All(handler.Writes, request => Assert.Equal("PLowned", request["playlistId"]!.GetValue<string>()));
         var actions = handler.Writes.Select(request => Assert.Single(request["actions"]!.AsArray())!).ToArray();
         Assert.Equal("ACTION_ADD_VIDEO", actions[0]["action"]!.GetValue<string>());
-        Assert.Equal("DEDUPE_OPTION_SKIP", actions[0]["dedupeOption"]!.GetValue<string>());
+        Assert.Null(actions[0]["dedupeOption"]);
         Assert.Equal("ACTION_REMOVE_VIDEO", actions[1]["action"]!.GetValue<string>());
         Assert.Equal("occurrence-2", actions[1]["setVideoId"]!.GetValue<string>());
         Assert.Equal("ACTION_MOVE_VIDEO_BEFORE", actions[2]["action"]!.GetValue<string>());
@@ -96,6 +96,83 @@ public class PlaylistTests
         Assert.Equal(5, handler.Writes.Count);
     }
 
+    [Fact]
+    public async Task AddSkipsTracksAlreadyPresentOnALaterPageEvenWhenARecordIsUnavailable()
+    {
+        var songs = Pages.PlaylistSongs(Fixtures.Load("playlist.json"));
+        var existing = songs[0];
+        var fresh = songs[1];
+        var handler = new PlaylistHandler
+        {
+            Read = payload => payload["continuation"] is null
+                ? """{"musicPlaylistShelfRenderer":{"contents":[],"continuations":[{"nextContinuationData":{"continuation":"more"}}]}}"""
+                : $$$$"""
+                    {"appendContinuationItemsAction":{"continuationItems":[{"musicResponsiveListItemRenderer":
+                    {"playlistItemData":{"videoId":"{{{{existing.Id}}}}"}}}]}}
+                    """,
+        };
+        using var music = TestMusic(handler);
+        using var account = new YouTubeAccount(music, new Library(null), new Settings(), new TestSecretStore(), Fixtures.Scratch);
+        var session = account.PlaylistSession!;
+        var edits = new List<string>();
+        account.PlaylistEdited += edits.Add;
+
+        Assert.Equal(0, await account.AddPlaylistSongsAsync(session, "PLowned", [existing]));
+        Assert.Empty(handler.Writes);
+        Assert.Empty(edits);
+
+        Assert.Equal(1, await account.AddPlaylistSongsAsync(session, "PLowned", [existing, fresh, fresh]));
+        var write = Assert.Single(handler.Writes);
+        Assert.Equal(fresh.Id, Assert.Single(write["actions"]!.AsArray())!["addedVideoId"]!.GetValue<string>());
+        Assert.Equal(["PLowned"], edits);
+        Assert.Equal(4, handler.PlaylistReads);
+    }
+
+    [Fact]
+    public async Task AddStopsWithoutWritingIfThePlaylistCannotBeReadCompletely()
+    {
+        var handler = new PlaylistHandler
+        {
+            Read = _ => """{"musicPlaylistShelfRenderer":{"contents":[],"continuations":[{"nextContinuationData":{"continuation":"repeat"}}]}}""",
+        };
+        using var music = TestMusic(handler);
+        var song = Pages.PlaylistSongs(Fixtures.Load("playlist.json"))[0];
+
+        await Assert.ThrowsAsync<MusicException>(() => music.AddPlaylistSongsAsync("PLowned", [song], default));
+        Assert.Empty(handler.Writes);
+        Assert.Equal(2, handler.PlaylistReads);
+    }
+
+    [Fact]
+    public async Task FullPlaylistWalkContinuesPastAnEmptyPageAndAThousandTracks()
+    {
+        var rows = Fixtures.Load("playlist.json").First("musicPlaylistShelfRenderer")["contents"].Array.Take(100);
+        var handler = new PlaylistHandler
+        {
+            Read = payload =>
+            {
+                var page = payload["continuation"] is { } token ? int.Parse(token.GetValue<string>()) : 0;
+                var shelf = new JsonObject
+                {
+                    ["contents"] = page == 1 ? new JsonArray()
+                        : new JsonArray([.. rows.Select(row => JsonNode.Parse(row.Raw.GetRawText()))]),
+                };
+                if (page < 11)
+                    shelf["continuations"] = new JsonArray { new JsonObject
+                    {
+                        ["nextContinuationData"] = new JsonObject { ["continuation"] = (page + 1).ToString() },
+                    } };
+                return new JsonObject { ["musicPlaylistShelfRenderer"] = shelf }.ToJsonString();
+            },
+        };
+        using var music = TestMusic(handler);
+
+        var songs = await music.PlaylistSongsAsync("VLPLowned", limit: null);
+
+        Assert.Equal(1100, songs.Length);
+        Assert.Equal(12, handler.PlaylistReads);
+    }
+
     private static YouTubeMusic TestMusic(HttpMessageHandler handler)
     {
         var sessions = new AccountSessions();
@@ -109,6 +186,8 @@ public class PlaylistTests
     {
         internal List<JsonObject> Writes { get; } = [];
         internal bool Reject { get; set; }
+        internal int PlaylistReads { get; private set; }
+        internal Func<JsonObject, string>? Read { get; init; }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
@@ -123,6 +202,13 @@ public class PlaylistTests
                       {"playlistAddToOptionRenderer":{"playlistId":"VLPLowned","title":{"runs":[{"text":"My playlist"}]}}}
                     ]}}]}
                     """;
+            }
+            else if (path.EndsWith("/browse"))
+            {
+                Assert.True(request.Headers.Contains("Authorization"));
+                PlaylistReads++;
+                var payload = JsonNode.Parse(await request.Content!.ReadAsStringAsync(cancellationToken))!.AsObject();
+                response = Read?.Invoke(payload) ?? """{"musicPlaylistShelfRenderer":{"contents":[]}}""";
             }
             else if (path.EndsWith("/browse/edit_playlist"))
             {

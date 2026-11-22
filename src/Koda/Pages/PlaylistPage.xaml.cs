@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Koda.Core;
 using Koda.Helpers;
@@ -27,7 +28,9 @@ public sealed partial class PlaylistPage : Page
     private string? _playlistSession;
     private bool _active;
     private bool _loadingPage;
-    private bool _loadingMore;
+    private Task<bool>? _loadMoreTask;
+    private CancellationTokenSource? _loadCancellation;
+    private HashSet<string> _seenContinuations = new(StringComparer.Ordinal);
     private bool _editing;
     private int _loadVersion;
     private ScrollViewer? _scroller;
@@ -70,6 +73,7 @@ public sealed partial class PlaylistPage : Page
     {
         _active = false;
         _loadVersion++;
+        CancelLoad();
         App.Library.Changed -= OnLibraryChanged;
         App.Account.Changed -= OnAccountChanged;
         App.Account.PlaylistEdited -= OnPlaylistEdited;
@@ -79,19 +83,20 @@ public sealed partial class PlaylistPage : Page
 
     /// <summary>A playlist to open with what to show if YouTube serves it without a page
     /// header, as it does for OLAK5uy_ audio playlists (docs\parsing.md).</summary>
-    public sealed record PlaylistRequest(string Id, string Title, string? Subtitle, Artwork? Artwork);
+    public sealed record PlaylistRequest(string Id, string Title, string? Subtitle, Artwork? Artwork, bool LoadAll = false);
 
     private PlaylistRequest? _fallback;
 
-    private async Task<EnginePlaylist> FetchAsync(bool fresh)
+    private async Task<EnginePlaylist> FetchAsync(bool fresh, CancellationToken cancellation)
     {
         try
         {
-            return await EngineHost.Music.PlaylistAsync(_id, fresh: fresh);
+            return await EngineHost.Music.PlaylistAsync(_id, fresh ? cancellation : default, fresh: fresh);
         }
         catch (MusicException error) when (error.Kind == MusicException.Reason.BadResponse && _id.StartsWith("OLAK5uy_"))
         {
-            var songs = await EngineHost.Music.PlaylistSongsAsync("VL" + _id, limit: 500);
+            var songs = await EngineHost.Music.PlaylistSongsAsync("VL" + _id,
+                limit: _fallback?.LoadAll == true ? null : 500, cancellation: cancellation);
             var title = _fallback?.Title ?? "Songs";
             return new EnginePlaylist(new PlaylistSummary(_id, title, null, _fallback?.Artwork ?? songs.FirstOrDefault()?.Artwork),
                 _fallback?.Subtitle, $"{songs.Length} songs", null, [.. songs.Select(song => new PlaylistTrack(song))], null);
@@ -101,11 +106,15 @@ public sealed partial class PlaylistPage : Page
     private async Task LoadAsync(bool fresh = false)
     {
         var version = ++_loadVersion;
+        CancelLoad();
+        _loadCancellation = new CancellationTokenSource();
+        var cancellation = _loadCancellation.Token;
         var session = App.Account.PlaylistSession;
-        var previousCount = _rows.Count;
+        var loadAll = _fallback?.LoadAll == true;
+        var previousCount = loadAll ? 0 : _rows.Count;
         var initial = _playlist is null;
         _loadingPage = true;
-        _loadingMore = false;
+        _loadMoreTask = null;
         Error.Visibility = Visibility.Collapsed;
         MoreSkeleton.Content = null;
         MoreError.Visibility = Visibility.Collapsed;
@@ -119,14 +128,15 @@ public sealed partial class PlaylistPage : Page
         }
         try
         {
-            var page = await FetchAsync(fresh);
+            var page = await FetchAsync(fresh, cancellation);
             if (version != _loadVersion) return;
             var tracks = page.Tracks.ToList();
             var continuation = page.Continuation;
-            var seen = new HashSet<string>();
-            while (tracks.Count < previousCount && continuation is { } token && seen.Add(token))
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            while (tracks.Count < previousCount && continuation is { } token)
             {
-                var more = await EngineHost.Music.PlaylistMoreAsync(token);
+                if (!seen.Add(token)) throw MusicException.BadResponse(200);
+                var more = await EngineHost.Music.PlaylistMoreAsync(token, cancellation);
                 if (version != _loadVersion) return;
                 tracks.AddRange(more.Tracks);
                 continuation = more.Continuation;
@@ -138,6 +148,7 @@ public sealed partial class PlaylistPage : Page
             _songs.Clear();
             Append(tracks);
             _continuation = continuation;
+            _seenContinuations = seen;
             ShowHeader(page);
             Tracks.Visibility = Visibility.Visible;
             UpdateEmpty();
@@ -147,6 +158,7 @@ public sealed partial class PlaylistPage : Page
             if (version != _loadVersion) return;
             if (initial) Error.ShowError(error, () => _ = LoadAsync());
             else App.Shell?.Note($"Couldn't refresh the playlist. {Errors.Describe(error)}");
+            return;
         }
         finally
         {
@@ -157,6 +169,15 @@ public sealed partial class PlaylistPage : Page
                 UpdateEdit();
             }
         }
+
+        if (loadAll) await AllSongsAsync();
+    }
+
+    private void CancelLoad()
+    {
+        _loadCancellation?.Cancel();
+        _loadCancellation?.Dispose();
+        _loadCancellation = null;
     }
 
     private void ShowHeader(EnginePlaylist page)
@@ -215,64 +236,79 @@ public sealed partial class PlaylistPage : Page
         }
     }
 
-    private async Task LoadMoreAsync()
+    private async Task<bool> LoadMoreAsync()
     {
-        if (!_active || _loadingPage || _loadingMore || _continuation is not { } token)
-        {
-            return;
-        }
+        if (!_active || _loadingPage || _continuation is not { } token || _loadCancellation is not { } load)
+            return false;
 
-        _loadingMore = true;
-        var version = _loadVersion;
+        var task = _loadMoreTask ??= LoadNextPageAsync(token, _loadVersion, load.Token);
+        try { return await task; }
+        finally { if (_loadMoreTask == task) _loadMoreTask = null; }
+    }
+
+    private async Task<bool> LoadNextPageAsync(string token, int version, CancellationToken cancellation)
+    {
         MoreError.Visibility = Visibility.Collapsed;
         MoreSkeleton.Content = Skeletons.Rows(4, numbered: true);
         try
         {
-            var more = await EngineHost.Music.PlaylistMoreAsync(token);
-            if (version != _loadVersion) return;
+            if (_seenContinuations.Contains(token)) throw MusicException.BadResponse(200);
+            var more = await EngineHost.Music.PlaylistMoreAsync(token, cancellation);
+            if (version != _loadVersion) return false;
+            _seenContinuations.Add(token);
             Append(more.Tracks);
             _continuation = more.Continuation;
+            DownloadButton.Songs = _songs.ToArray();
             UpdateEmpty();
+            return true;
         }
         catch (Exception)
         {
             if (version == _loadVersion) MoreError.Visibility = Visibility.Visible;
+            return false;
         }
         finally
         {
             if (version == _loadVersion)
             {
                 MoreSkeleton.Content = null;
-                _loadingMore = false;
             }
         }
     }
 
-    private void OnMoreRetryClick(object sender, RoutedEventArgs e) => _ = LoadMoreAsync();
+    private void OnMoreRetryClick(object sender, RoutedEventArgs e)
+    {
+        if (_continuation is { } token && _seenContinuations.Contains(token)) _ = LoadAsync(fresh: true);
+        else if (_fallback?.LoadAll == true) _ = AllSongsAsync();
+        else _ = LoadMoreAsync();
+    }
 
     /// <summary>Every track, for Play and Shuffle: the pages not yet seen are fetched first.</summary>
     private async Task<IReadOnlyList<Song>> AllSongsAsync()
     {
-        while (_continuation is not null && _songs.Count < 1000)
+        var version = _loadVersion;
+        while (version == _loadVersion && _continuation is not null)
         {
-            var before = _songs.Count;
-            await LoadMoreAsync();
-            if (_songs.Count == before) break;
+            if (!await LoadMoreAsync()) break;
         }
 
-        return _songs.ToArray();
+        return version == _loadVersion ? _songs.ToArray() : [];
     }
 
-    private async void OnPlayClick(object sender, RoutedEventArgs e)
+    private void OnPlayClick(object sender, RoutedEventArgs e)
     {
-        if (_songs.Count == 0) return;
+        if (_songs.Count > 0) _ = PlayPlaylistAsync(_songs[0]);
+    }
+
+    private async Task PlayPlaylistAsync(Song song)
+    {
         var playback = PlaybackService.Instance;
         var profile = Profiles.ActiveKey;
         var source = Source;
-        _ = playback.PlayNowAsync(_songs[0], _songs.ToArray(), source);
+        var known = _songs.Count;
+        _ = playback.PlayNowAsync(song, _songs.ToArray(), source);
         var anchor = playback.Queue.Items.FirstOrDefault()?.Id;
         // The queue grows to the whole playlist once the rest arrives.
-        var known = _songs.Count;
         var all = await AllSongsAsync();
         if (all.Count > known && Profiles.ActiveKey == profile && playback.Queue.Items.Count == known
             && playback.Queue.Items[0].Id == anchor)
@@ -294,7 +330,7 @@ public sealed partial class PlaylistPage : Page
     {
         if (e.ClickedItem is TrackRow row)
         {
-            _ = PlaybackService.Instance.PlayNowAsync(row.Song, _songs.ToArray(), Source);
+            _ = PlayPlaylistAsync(row.Song);
         }
     }
 

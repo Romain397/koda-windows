@@ -91,8 +91,15 @@ public sealed class YouTubeAccount : IDisposable
         return playlists;
     }
 
-    public Task AddPlaylistSongsAsync(string session, string id, IReadOnlyList<Song> songs) =>
-        EditPlaylistAsync(session, id, token => _music.AddPlaylistSongsAsync(id, songs, token));
+    public async Task<int> AddPlaylistSongsAsync(string session, string id, IReadOnlyList<Song> songs)
+    {
+        var added = 0;
+        await EditPlaylistAsync(session, id, async token =>
+        {
+            added = await _music.AddPlaylistSongsAsync(id, songs, token);
+        }, changed: () => added > 0);
+        return added;
+    }
 
     public Task RemovePlaylistTrackAsync(string session, string id, string videoId, string setVideoId) =>
         EditPlaylistAsync(session, id, token => _music.RemovePlaylistTrackAsync(id, videoId, setVideoId, token));
@@ -106,7 +113,7 @@ public sealed class YouTubeAccount : IDisposable
         _library.UpdateSavedPlaylistTitle(Parsing.Pages.PlaylistId(id), title);
     });
 
-    private async Task EditPlaylistAsync(string session, string id, Func<CancellationToken, Task> edit)
+    private async Task EditPlaylistAsync(string session, string id, Func<CancellationToken, Task> edit, Func<bool>? changed = null)
     {
         await _work.WaitAsync(_stopping.Token);
         try
@@ -118,7 +125,7 @@ public sealed class YouTubeAccount : IDisposable
         {
             _work.Release();
         }
-        PlaylistEdited?.Invoke(Parsing.Pages.PlaylistId(id));
+        if (changed?.Invoke() != false) PlaylistEdited?.Invoke(Parsing.Pages.PlaylistId(id));
     }
 
     private void CheckPlaylistSession(string session)
