@@ -139,6 +139,51 @@ public sealed class Library
     public string[] Searches { get { lock (_lock) return [.. _s.Searches]; } }
     /// <summary>Playlists made here, newest first.</summary>
     public UserPlaylist[] UserPlaylists { get { lock (_lock) return [.. _s.UserPlaylists]; } }
+
+    public PlaylistReference[] PinnedPlaylists { get { lock (_lock) return [.. _s.PinnedPlaylists]; } }
+
+    public bool IsPinned(PlaylistReference playlist)
+    {
+        lock (_lock) return _s.PinnedPlaylists.Exists(playlist.SamePlaylist);
+    }
+
+    public void SetPlaylistPinned(PlaylistReference playlist, bool pinned) => Edit(s =>
+    {
+        var index = s.PinnedPlaylists.FindIndex(playlist.SamePlaylist);
+        if (!pinned && index >= 0) s.PinnedPlaylists.RemoveAt(index);
+        if (pinned && index < 0 && (!playlist.IsLocal || s.UserPlaylists.Exists(p => p.Id.ToString() == playlist.Id)))
+            s.PinnedPlaylists.Insert(0, playlist);
+    });
+
+    /// <summary>Place a pin before or after another pin in the active library.</summary>
+    public void MovePinnedPlaylist(PlaylistReference playlist, PlaylistReference anchor, bool after) => Edit(s =>
+    {
+        var pins = s.PinnedPlaylists;
+        var from = pins.FindIndex(playlist.SamePlaylist);
+        var anchorIndex = pins.FindIndex(anchor.SamePlaylist);
+        if (from < 0 || anchorIndex < 0 || from == anchorIndex) return;
+
+        var to = anchorIndex + (after ? 1 : 0);
+        if (from < to) to--;
+        if (from == to) return;
+        var pin = pins[from];
+        pins.RemoveAt(from);
+        pins.Insert(to, pin);
+    });
+
+    public PlaylistReference? ResolvePlaylist(PlaylistReference playlist)
+    {
+        if (playlist.IsLocal)
+            return Guid.TryParse(playlist.Id, out var id) && UserPlaylist(id) is { } local ? PlaylistReference.From(local) : null;
+
+        lock (_lock)
+        {
+            var saved = _s.Playlists.Find(p => Parsing.Pages.PlaylistId(p.Id) == playlist.Id);
+            return saved is not null ? PlaylistReference.From(saved)
+                : _s.PinnedPlaylists.Find(playlist.SamePlaylist) ?? playlist;
+        }
+    }
+
     /// <summary>Play counts and listening time per song, by video id.</summary>
     public IReadOnlyDictionary<string, SongStats> SongStats { get { lock (_lock) return new Dictionary<string, SongStats>(_s.SongStats); } }
     /// <summary>Seconds listened per day, keyed yyyy-MM-dd in the device's time zone.</summary>
@@ -328,6 +373,14 @@ public sealed class Library
     public void ToggleSave(PlaylistSummary playlist) => Edit(s => Toggle(s.Playlists, playlist, p => p.Id));
     public void ToggleSave(ArtistSummary artist) => Edit(s => Toggle(s.Artists, artist, a => a.Id));
 
+    internal void UpdateSavedPlaylistTitle(string id, string title) => Edit(s =>
+    {
+        var index = s.Playlists.FindIndex(playlist => Parsing.Pages.PlaylistId(playlist.Id) == id);
+        if (index >= 0) s.Playlists[index] = s.Playlists[index] with { Title = title };
+        var pinIndex = s.PinnedPlaylists.FindIndex(playlist => !playlist.IsLocal && playlist.Id == id);
+        if (pinIndex >= 0) s.PinnedPlaylists[pinIndex] = s.PinnedPlaylists[pinIndex] with { Title = title };
+    });
+
     private static void Toggle<T>(List<T> list, T item, Func<T, string> id)
     {
         var index = list.FindIndex(x => id(x) == id(item));
@@ -388,7 +441,21 @@ public sealed class Library
         EditPlaylist(id, p => p with { Name = trimmed });
     }
 
-    public void DeletePlaylist(Guid id) => Edit(s => s.UserPlaylists.RemoveAll(p => p.Id == id));
+    public void DeletePlaylist(Guid id) => Edit(s =>
+    {
+        var playlist = s.UserPlaylists.Find(p => p.Id == id);
+        s.UserPlaylists.RemoveAll(p => p.Id == id);
+        s.PinnedPlaylists.RemoveAll(p => p.IsLocal && p.Id == id.ToString());
+        if (playlist is not null && _file is { } file)
+        {
+            try
+            {
+                new PlaylistCoverStore(Path.GetDirectoryName(file)!).Remove(PlaylistReference.From(playlist));
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+    });
 
     /// <summary>Append the songs the playlist does not already hold; returns how many were added.</summary>
     public int AddToPlaylist(IEnumerable<Song> songs, Guid id)
@@ -545,6 +612,7 @@ public sealed class Library
         public List<Song> Recent { get; set; } = [];
         public List<string> Searches { get; set; } = [];
         public List<UserPlaylist> UserPlaylists { get; set; } = [];
+        public List<PlaylistReference> PinnedPlaylists { get; set; } = [];
         public Dictionary<string, SongStats> SongStats { get; set; } = [];
         public Dictionary<string, double> DailyListening { get; set; } = [];
         public Dictionary<string, double> LyricsOffsets { get; set; } = [];
@@ -678,6 +746,7 @@ public sealed class Library
         s.Recent ??= [];
         s.Searches ??= [];
         s.UserPlaylists ??= [];
+        s.PinnedPlaylists ??= [];
         s.SongStats ??= [];
         s.DailyListening ??= [];
         s.LyricsOffsets ??= [];
@@ -796,6 +865,7 @@ public sealed class Library
             s.Recent = restored.Recent;
             s.Searches = restored.Searches;
             s.UserPlaylists = restored.UserPlaylists;
+            s.PinnedPlaylists = restored.PinnedPlaylists;
             s.SongStats = restored.SongStats;
             s.DailyListening = restored.DailyListening;
             s.LyricsOffsets = restored.LyricsOffsets;

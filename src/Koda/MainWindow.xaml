@@ -118,6 +118,7 @@
                             </muxc:NavigationViewItem.Icon>
                         </muxc:NavigationViewItem>
 
+                        <muxc:NavigationViewItemHeader x:Name="PinnedPlaylistsHeader" Content="Pinned playlists" Visibility="Collapsed" />
                         <muxc:NavigationViewItemHeader x:Name="VideosHeader" Content="Videos" />
                         <muxc:NavigationViewItem x:Name="VideoHomeItem" Content="Videos" Tag="video-home" ToolTipService.ToolTip="Videos for you">
                             <muxc:NavigationViewItem.Icon>
@@ -344,6 +345,12 @@
                                 TextTrimming="CharacterEllipsis"
                                 TextWrapping="NoWrap"
                                 Visibility="Collapsed" />
+                            <Button x:Name="PlaylistSourceButton" Click="OnPlaylistSourceClick" Visibility="Collapsed"
+                                    Padding="0" MinHeight="0" BorderThickness="0" Background="Transparent"
+                                    HorizontalAlignment="Stretch" HorizontalContentAlignment="Left">
+                                <TextBlock x:Name="PlaylistSourceText" Style="{ThemeResource CaptionTextBlockStyle}"
+                                           Foreground="{ThemeResource AccentTextFillColorPrimaryBrush}" TextTrimming="CharacterEllipsis" />
+                            </Button>
                         </StackPanel>
                         <Button
                             x:Name="LikeButton"

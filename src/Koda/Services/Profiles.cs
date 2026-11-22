@@ -23,6 +23,9 @@ public static class Profiles
 
     public static string ActiveFolder => Roster.Folder(Roster.Active);
 
+    // The original profile can have no roster on disk, so its GUID can change between launches.
+    public static string ActiveKey => Roster.Active.UsesRoot ? "root" : Roster.ActiveId.ToString();
+
     public static Koda.Core.ISecretStore ActiveCredentials => new CredentialStore(ProfileRoster.CredentialTarget(Roster.Active));
 
     /// <summary>The active profile keeps up with its account: who it is, or that it needs signing in.</summary>

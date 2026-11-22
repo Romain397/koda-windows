@@ -19,6 +19,7 @@ public static class Errors
     {
         MusicException { Kind: MusicException.Reason.Network } => "Check your connection, then try again.",
         MusicException { Kind: MusicException.Reason.RateLimited } => "Wait a minute, then try again.",
+        MusicException { Kind: MusicException.Reason.SignedOut } => "Sign in to the active profile's YouTube Music account and try again.",
         MusicException { Kind: MusicException.Reason.BotCheck } => "A fresh session usually fixes it. Try again in a moment.",
         MusicException { Kind: MusicException.Reason.Unplayable } m => m.Message,
         MusicException { Kind: MusicException.Reason.BadResponse } => "YouTube answered with something Koda couldn't read. Try again.",

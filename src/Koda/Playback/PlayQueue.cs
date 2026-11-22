@@ -7,10 +7,12 @@ namespace Koda.Playback;
 
 /// <summary>One occurrence of a song in the queue. The same song can be queued twice, so
 /// anything planned across an await (a skip, a removal, a jump) anchors on this id.</summary>
-public sealed record QueueItem(Guid Id, Song Song)
+public sealed record QueueItem(Guid Id, Song Song, PlaylistSource? Source = null)
 {
-    public static QueueItem Of(Song song) => new(Guid.NewGuid(), song);
+    public static QueueItem Of(Song song, PlaylistSource? source = null) => new(Guid.NewGuid(), song, source);
 }
+
+public sealed record PlaylistSource(string ProfileKey, PlaylistReference Playlist);
 
 public enum RepeatMode
 {
@@ -46,9 +48,9 @@ public sealed class PlayQueue
 
     /// <summary>Play <paramref name="songs"/> from <paramref name="start"/>; shuffled, the start song plays
     /// first and the rest follow in random order.</summary>
-    public void Replace(IReadOnlyList<Song> songs, int start = 0, bool shuffled = false)
+    public void Replace(IReadOnlyList<Song> songs, int start = 0, bool shuffled = false, PlaylistSource? source = null)
     {
-        _items = [.. songs.Select(QueueItem.Of)];
+        _items = [.. songs.Select(song => QueueItem.Of(song, source))];
         _unshuffled = [];
         IsShuffled = false;
         CurrentIndex = _items.Count == 0 ? null : Math.Clamp(start, 0, _items.Count - 1);
@@ -66,16 +68,16 @@ public sealed class PlayQueue
     // MARK: Adding and removing
 
     /// <summary>Insert right after the current song, in the order given.</summary>
-    public void PlayNext(IReadOnlyList<Song> songs)
+    public void PlayNext(IReadOnlyList<Song> songs, PlaylistSource? source = null)
     {
-        var added = songs.Select(QueueItem.Of).ToList();
-        if (added.Count == 0) return;
+        if (songs.Count == 0) return;
         if (CurrentIndex is not { } current)
         {
-            Append(songs);
+            Append(songs, source);
             return;
         }
 
+        var added = songs.Select(song => QueueItem.Of(song, source)).ToList();
         _items.InsertRange(current + 1, added);
         if (IsShuffled && _unshuffled.IndexOf(_items[current].Id) is >= 0 and var anchor)
         {
@@ -84,9 +86,9 @@ public sealed class PlayQueue
     }
 
     /// <summary>Add to the end of the queue.</summary>
-    public void Append(IReadOnlyList<Song> songs)
+    public void Append(IReadOnlyList<Song> songs, PlaylistSource? source = null)
     {
-        var added = songs.Select(QueueItem.Of).ToList();
+        var added = songs.Select(song => QueueItem.Of(song, source)).ToList();
         _items.AddRange(added);
         if (IsShuffled) _unshuffled.AddRange(added.Select(a => a.Id));
         if (CurrentIndex is null && _items.Count > 0) CurrentIndex = 0;
@@ -223,14 +225,16 @@ public sealed class PlayQueue
 
     // MARK: Saving (persistQueue on the Mac)
 
-    public sealed record Saved(Song[] Songs, int? Current, bool Shuffled, RepeatMode Repeat);
+    public sealed record Saved(Song[] Songs, int? Current, bool Shuffled, RepeatMode Repeat, PlaylistSource?[]? Sources = null);
 
-    public Saved Save() => new([.. _items.Select(i => i.Song)], CurrentIndex, IsShuffled, Repeat);
+    public Saved Save() => new([.. _items.Select(i => i.Song)], CurrentIndex, IsShuffled, Repeat,
+        _items.Any(item => item.Source is not null) ? [.. _items.Select(item => item.Source)] : null);
 
     public static PlayQueue Restore(Saved saved)
     {
         var queue = new PlayQueue { Repeat = saved.Repeat };
-        queue._items = [.. saved.Songs.Select(QueueItem.Of)];
+        var sources = saved.Sources?.Length == saved.Songs.Length ? saved.Sources : null;
+        queue._items = [.. saved.Songs.Select((song, index) => QueueItem.Of(song, sources?[index]))];
         queue.CurrentIndex = queue._items.Count == 0 ? null : Math.Clamp(saved.Current ?? 0, 0, queue._items.Count - 1);
         // The pre-shuffle order is not kept across launches; the shuffled order simply stands.
         queue.IsShuffled = false;

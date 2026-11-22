@@ -67,6 +67,43 @@ public static class Dialogs
         return true;
     }
 
+    public static Task<string?> AskYouTubePlaylistNameAsync(string title) =>
+        AskAsync("Rename YouTube Music Playlist", title, "Save", "Name", "The name updates on YouTube Music.");
+
+    public static async Task AddToYouTubeMusicPlaylistAsync(string session, IReadOnlyList<Song> songs)
+    {
+        try
+        {
+            var playlists = await App.Account.EditablePlaylistsAsync(session, songs[0].Id);
+            if (playlists.Length == 0)
+            {
+                App.Shell?.Note("YouTube Music didn't return any playlists you can edit.");
+                return;
+            }
+
+            var list = new ListView
+            {
+                ItemsSource = playlists,
+                DisplayMemberPath = nameof(PlaylistSummary.Title),
+                SelectionMode = ListViewSelectionMode.Single,
+                MaxHeight = 340,
+                MinWidth = 280,
+            };
+            Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(list, "YouTube Music playlists");
+            var dialog = Build("Add to YouTube Music Playlist", list, "Add", close: "Cancel");
+            dialog.IsPrimaryButtonEnabled = false;
+            list.SelectionChanged += (_, _) => dialog.IsPrimaryButtonEnabled = list.SelectedItem is PlaylistSummary;
+            if (await ShowAsync(dialog) != ContentDialogResult.Primary || list.SelectedItem is not PlaylistSummary playlist) return;
+
+            await App.Account.AddPlaylistSongsAsync(session, playlist.Id, songs);
+            App.Shell?.Note($"Updated {playlist.Title} on YouTube Music.");
+        }
+        catch (Exception error)
+        {
+            App.Shell?.Note($"Couldn't update the YouTube Music playlist. {Errors.Describe(error)}");
+        }
+    }
+
     /// <summary>A destructive question with a way out; true only when the action was chosen.</summary>
     public static async Task<bool> ConfirmAsync(string title, string message, string action)
     {

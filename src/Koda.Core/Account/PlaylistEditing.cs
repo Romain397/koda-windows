@@ -1,0 +1,99 @@
+using System.Text.Json.Nodes;
+using Koda.Core.InnerTube;
+using Koda.Core.Parsing;
+
+namespace Koda.Core;
+
+public sealed partial class YouTubeMusic
+{
+    internal async Task<PlaylistSummary[]> EditablePlaylistsAsync(string videoId, CancellationToken cancellation)
+    {
+        // YouTube's save picker lists playlists this account can actually add to.
+        var root = await _api.WebAsync("playlist/get_add_to_playlist", new JsonObject
+        {
+            ["videoIds"] = new JsonArray { videoId },
+            ["excludeWatchLater"] = true,
+        }, cancellation, Signing.Required);
+
+        var playlists = new List<PlaylistSummary>();
+        foreach (var option in root.Objects("playlistAddToOptionRenderer"))
+        {
+            if (option["playlistId"].NonEmpty is not { } rawId) continue;
+            var id = Pages.PlaylistId(rawId);
+            if (!Pages.IsEditablePlaylistId(id)) continue;
+            var title = option["title"].NonEmpty ?? option["title"].Text().TrimmedOrNull()
+                ?? option["playlistTitle"].NonEmpty ?? option["playlistTitle"].Text().TrimmedOrNull();
+            if (title is null) continue;
+            playlists.Add(new PlaylistSummary(id, title, null, null));
+        }
+        return [.. playlists.DistinctBy(playlist => playlist.Id)];
+    }
+
+    internal async Task AddPlaylistSongsAsync(string id, IReadOnlyList<Song> songs, CancellationToken cancellation)
+    {
+        var sent = 0;
+        foreach (var batch in songs.Select(song => song.Id).Distinct().Chunk(50))
+        {
+            var actions = new JsonArray([.. batch.Select(videoId => new JsonObject
+            {
+                ["action"] = "ACTION_ADD_VIDEO",
+                ["addedVideoId"] = videoId,
+                ["dedupeOption"] = "DEDUPE_OPTION_SKIP",
+            })]);
+            try
+            {
+                await EditPlaylistAsync(id, actions, cancellation);
+            }
+            catch (Exception error) when (sent > 0 && error is (MusicException or InvalidOperationException))
+            {
+                throw new InvalidOperationException("YouTube accepted the first part of the list. Refresh the playlist before trying again.", error);
+            }
+            sent += batch.Length;
+        }
+    }
+
+    internal Task RemovePlaylistTrackAsync(string id, string videoId, string setVideoId, CancellationToken cancellation) =>
+        EditPlaylistAsync(id, new JsonArray { new JsonObject
+        {
+            ["action"] = "ACTION_REMOVE_VIDEO",
+            ["removedVideoId"] = videoId,
+            ["setVideoId"] = setVideoId,
+        } }, cancellation);
+
+    internal Task MovePlaylistTrackAsync(string id, string setVideoId, string beforeSetVideoId, CancellationToken cancellation) =>
+        EditPlaylistAsync(id, new JsonArray { new JsonObject
+        {
+            ["action"] = "ACTION_MOVE_VIDEO_BEFORE",
+            ["setVideoId"] = setVideoId,
+            ["movedSetVideoIdSuccessor"] = beforeSetVideoId,
+        } }, cancellation);
+
+    internal Task RenamePlaylistAsync(string id, string title, CancellationToken cancellation) =>
+        EditPlaylistAsync(id, new JsonArray { new JsonObject
+        {
+            ["action"] = "ACTION_SET_PLAYLIST_NAME",
+            ["playlistName"] = title,
+        } }, cancellation);
+
+    private async Task EditPlaylistAsync(string id, JsonArray actions, CancellationToken cancellation)
+    {
+        id = Pages.PlaylistId(id);
+        if (!Pages.IsEditablePlaylistId(id)) throw new InvalidOperationException("This playlist can't be edited.");
+
+        try
+        {
+            var root = await _api.MusicAsync("browse/edit_playlist", new JsonObject
+            {
+                ["playlistId"] = id,
+                ["actions"] = actions,
+            }, cancellation, Signing.Required);
+            if (root["status"].NonEmpty != "STATUS_SUCCEEDED")
+                throw new InvalidOperationException("YouTube Music didn't accept the playlist change. Check that you can edit this playlist.");
+        }
+        finally
+        {
+            // If the reply was lost, re-opening the playlist must still fetch its current contents.
+            ClearPageCache();
+        }
+    }
+}

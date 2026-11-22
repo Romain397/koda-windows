@@ -15,10 +15,18 @@ internal static partial class Win32
     public const uint WM_ENDSESSION = 0x0016;
     public const uint WM_NCDESTROY = 0x0082;
     public const uint WM_COMMAND = 0x0111;
+    public const uint WM_APPCOMMAND = 0x0319;
     public const uint WM_EXITSIZEMOVE = 0x0232;
     public const uint WM_NULL = 0x0000;
     public const uint WM_APP = 0x8000;
     public const uint WM_APP_TRAY = WM_APP + 1;
+
+    public const int APPCOMMAND_MEDIA_NEXTTRACK = 11;
+    public const int APPCOMMAND_MEDIA_PREVIOUSTRACK = 12;
+    public const int APPCOMMAND_MEDIA_STOP = 13;
+    public const int APPCOMMAND_MEDIA_PLAY_PAUSE = 14;
+    public const int APPCOMMAND_MEDIA_PLAY = 46;
+    public const int APPCOMMAND_MEDIA_PAUSE = 47;
 
     public const int GWLP_WNDPROC = -4;
 

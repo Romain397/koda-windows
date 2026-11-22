@@ -24,24 +24,38 @@ public sealed partial class PlaylistPage : Page
     private readonly ObservableCollection<TrackRow> _rows = [];
     private readonly List<Song> _songs = [];
     private string? _continuation;
+    private string? _playlistSession;
+    private bool _active;
+    private bool _loadingPage;
     private bool _loadingMore;
+    private bool _editing;
+    private int _loadVersion;
     private ScrollViewer? _scroller;
+
+    private PlaylistReference? Source => _playlist is { } page ? PlaylistReference.From(page.Playlist) : null;
+
+    private bool CanEdit => _active && !_loadingPage && !_editing && _playlist is { CanEdit: true }
+        && _playlistSession is { } session && App.Account.PlaylistSession == session;
 
     public PlaylistPage()
     {
         InitializeComponent();
         Tracks.ItemsSource = _rows;
-        SongMenu.Attach(Tracks, () => _songs);
-        App.Library.Changed += OnLibraryChanged;
-        Unloaded += (_, _) => App.Library.Changed -= OnLibraryChanged;
+        SongMenu.Attach(Tracks, () => _songs, rowActions: TrackActions, playlist: () => Source);
     }
 
     protected override void OnNavigatedTo(NavigationEventArgs args)
     {
         base.OnNavigatedTo(args);
+        _active = true;
+        App.Library.Changed += OnLibraryChanged;
+        App.Account.Changed += OnAccountChanged;
+        App.Account.PlaylistEdited += OnPlaylistEdited;
+        PlaylistCovers.Changed += OnCoverChanged;
         if (args.Parameter is string id && id.Length > 0)
         {
             _id = id;
+            _fallback = null;
             _ = LoadAsync();
         }
         else if (args.Parameter is PlaylistRequest request)
@@ -52,57 +66,96 @@ public sealed partial class PlaylistPage : Page
         }
     }
 
+    protected override void OnNavigatedFrom(NavigationEventArgs args)
+    {
+        _active = false;
+        _loadVersion++;
+        App.Library.Changed -= OnLibraryChanged;
+        App.Account.Changed -= OnAccountChanged;
+        App.Account.PlaylistEdited -= OnPlaylistEdited;
+        PlaylistCovers.Changed -= OnCoverChanged;
+        base.OnNavigatedFrom(args);
+    }
+
     /// <summary>A playlist to open with what to show if YouTube serves it without a page
     /// header, as it does for OLAK5uy_ audio playlists (docs\parsing.md).</summary>
     public sealed record PlaylistRequest(string Id, string Title, string? Subtitle, Artwork? Artwork);
 
     private PlaylistRequest? _fallback;
 
-    private async Task<EnginePlaylist> FetchAsync()
+    private async Task<EnginePlaylist> FetchAsync(bool fresh)
     {
         try
         {
-            return await EngineHost.Music.PlaylistAsync(_id);
+            return await EngineHost.Music.PlaylistAsync(_id, fresh: fresh);
         }
         catch (MusicException error) when (error.Kind == MusicException.Reason.BadResponse && _id.StartsWith("OLAK5uy_"))
         {
             var songs = await EngineHost.Music.PlaylistSongsAsync("VL" + _id, limit: 500);
             var title = _fallback?.Title ?? "Songs";
             return new EnginePlaylist(new PlaylistSummary(_id, title, null, _fallback?.Artwork ?? songs.FirstOrDefault()?.Artwork),
-                _fallback?.Subtitle, $"{songs.Length} songs", null, songs, null);
+                _fallback?.Subtitle, $"{songs.Length} songs", null, [.. songs.Select(song => new PlaylistTrack(song))], null);
         }
     }
 
-    private async Task LoadAsync()
+    private async Task LoadAsync(bool fresh = false)
     {
+        var version = ++_loadVersion;
+        var session = App.Account.PlaylistSession;
+        var previousCount = _rows.Count;
+        var initial = _playlist is null;
+        _loadingPage = true;
+        _loadingMore = false;
         Error.Visibility = Visibility.Collapsed;
-        Tracks.Visibility = Visibility.Collapsed;
-        var skeleton = new StackPanel { Spacing = 28 };
-        skeleton.Children.Add(Skeletons.Hero());
-        skeleton.Children.Add(Skeletons.Rows(10, numbered: true));
-        SkeletonHost.Content = skeleton;
+        MoreSkeleton.Content = null;
+        MoreError.Visibility = Visibility.Collapsed;
+        UpdateEdit();
+        if (initial)
+        {
+            var skeleton = new StackPanel { Spacing = 28 };
+            skeleton.Children.Add(Skeletons.Hero());
+            skeleton.Children.Add(Skeletons.Rows(10, numbered: true));
+            SkeletonHost.Content = skeleton;
+        }
         try
         {
-            var page = await FetchAsync();
+            var page = await FetchAsync(fresh);
+            if (version != _loadVersion) return;
+            var tracks = page.Tracks.ToList();
+            var continuation = page.Continuation;
+            var seen = new HashSet<string>();
+            while (tracks.Count < previousCount && continuation is { } token && seen.Add(token))
+            {
+                var more = await EngineHost.Music.PlaylistMoreAsync(token);
+                if (version != _loadVersion) return;
+                tracks.AddRange(more.Tracks);
+                continuation = more.Continuation;
+            }
+
             _playlist = page;
+            _playlistSession = session;
             _rows.Clear();
             _songs.Clear();
-            Append(page.Songs);
-            _continuation = page.Continuation;
+            Append(tracks);
+            _continuation = continuation;
             ShowHeader(page);
             Tracks.Visibility = Visibility.Visible;
-            if (_songs.Count == 0 && _continuation is null)
-            {
-                Error.Show("This playlist is empty", "", "");
-            }
+            UpdateEmpty();
         }
         catch (Exception error)
         {
-            Error.ShowError(error, () => _ = LoadAsync());
+            if (version != _loadVersion) return;
+            if (initial) Error.ShowError(error, () => _ = LoadAsync());
+            else App.Shell?.Note($"Couldn't refresh the playlist. {Errors.Describe(error)}");
         }
         finally
         {
-            SkeletonHost.Content = null;
+            if (version == _loadVersion)
+            {
+                _loadingPage = false;
+                SkeletonHost.Content = null;
+                UpdateEdit();
+            }
         }
     }
 
@@ -112,7 +165,7 @@ public sealed partial class PlaylistPage : Page
         HeroAuthor.Text = page.Author ?? "";
         HeroAuthor.Visibility = page.Author is null ? Visibility.Collapsed : Visibility.Visible;
         HeroMeta.Text = page.DetailLine ?? "";
-        Art.SetSource(HeroArt, page.Playlist.Artwork);
+        UpdateCover();
         Description.Text = page.Description ?? "";
         Description.Visibility = page.Description is null ? Visibility.Collapsed : Visibility.Visible;
         DownloadButton.Title = page.Playlist.Title;
@@ -120,20 +173,36 @@ public sealed partial class PlaylistPage : Page
         // A long playlist arrives in pages; Download fetches the rest first.
         DownloadButton.AllSongs = AllSongsAsync;
         UpdateSave();
+        UpdatePin();
     }
 
-    private void Append(IEnumerable<Song> songs)
+    private void UpdateCover()
     {
-        foreach (var song in songs)
+        if (Source is not { } source) return;
+        HeroArt.Source = PlaylistCovers.ImageFor(source, 200);
+        var menu = new MenuFlyout();
+        PlaylistCovers.AddMenuItems(menu, source);
+        CoverButton.Flyout = menu;
+    }
+
+    private void OnCoverChanged(PlaylistReference changed) => DispatcherQueue.TryEnqueue(() =>
+    {
+        if (_active && Source?.SamePlaylist(changed) == true) UpdateCover();
+    });
+
+    private void Append(IEnumerable<PlaylistTrack> tracks)
+    {
+        foreach (var track in tracks)
         {
-            _songs.Add(song);
-            _rows.Add(new TrackRow(_songs.Count, song));
+            _songs.Add(track.Song);
+            _rows.Add(new TrackRow(_songs.Count, track.Song, track.SetVideoId));
         }
     }
 
     private void OnTracksLoaded(object sender, RoutedEventArgs e)
     {
-        _scroller ??= FindScroller(Tracks);
+        if (_scroller is not null) return;
+        _scroller = FindScroller(Tracks);
         if (_scroller is not null)
         {
             _scroller.ViewChanged += (_, _) =>
@@ -148,28 +217,34 @@ public sealed partial class PlaylistPage : Page
 
     private async Task LoadMoreAsync()
     {
-        if (_loadingMore || _continuation is not { } token)
+        if (!_active || _loadingPage || _loadingMore || _continuation is not { } token)
         {
             return;
         }
 
         _loadingMore = true;
+        var version = _loadVersion;
         MoreError.Visibility = Visibility.Collapsed;
         MoreSkeleton.Content = Skeletons.Rows(4, numbered: true);
         try
         {
             var more = await EngineHost.Music.PlaylistMoreAsync(token);
-            Append(more.Songs);
+            if (version != _loadVersion) return;
+            Append(more.Tracks);
             _continuation = more.Continuation;
+            UpdateEmpty();
         }
         catch (Exception)
         {
-            MoreError.Visibility = Visibility.Visible;
+            if (version == _loadVersion) MoreError.Visibility = Visibility.Visible;
         }
         finally
         {
-            MoreSkeleton.Content = null;
-            _loadingMore = false;
+            if (version == _loadVersion)
+            {
+                MoreSkeleton.Content = null;
+                _loadingMore = false;
+            }
         }
     }
 
@@ -191,29 +266,139 @@ public sealed partial class PlaylistPage : Page
     private async void OnPlayClick(object sender, RoutedEventArgs e)
     {
         if (_songs.Count == 0) return;
-        _ = PlaybackService.Instance.PlayNowAsync(_songs[0], _songs.ToArray());
+        var playback = PlaybackService.Instance;
+        var profile = Profiles.ActiveKey;
+        var source = Source;
+        _ = playback.PlayNowAsync(_songs[0], _songs.ToArray(), source);
+        var anchor = playback.Queue.Items.FirstOrDefault()?.Id;
         // The queue grows to the whole playlist once the rest arrives.
         var known = _songs.Count;
         var all = await AllSongsAsync();
-        if (all.Count > known && PlaybackService.Instance.Queue.Items.Count == known)
+        if (all.Count > known && Profiles.ActiveKey == profile && playback.Queue.Items.Count == known
+            && playback.Queue.Items[0].Id == anchor)
         {
             // Appended after the known tail, in order, without a note.
-            PlaybackService.Instance.AddToQueue([.. all.Skip(known)], announce: false);
+            playback.AddToQueue([.. all.Skip(known)], announce: false, playlist: source);
         }
     }
 
-    private async void OnShuffleClick(object sender, RoutedEventArgs e) =>
-        await PlaybackService.Instance.ShuffleAsync(await AllSongsAsync());
+    private async void OnShuffleClick(object sender, RoutedEventArgs e)
+    {
+        var profile = Profiles.ActiveKey;
+        var source = Source;
+        var songs = await AllSongsAsync();
+        if (_active && Profiles.ActiveKey == profile) await PlaybackService.Instance.ShuffleAsync(songs, source);
+    }
 
     private void OnTrackClick(object sender, ItemClickEventArgs e)
     {
         if (e.ClickedItem is TrackRow row)
         {
-            _ = PlaybackService.Instance.PlayNowAsync(row.Song, _songs.ToArray());
+            _ = PlaybackService.Instance.PlayNowAsync(row.Song, _songs.ToArray(), Source);
         }
     }
 
-    private void OnLibraryChanged() => DispatcherQueue.TryEnqueue(UpdateSave);
+    private IEnumerable<MenuFlyoutItemBase> TrackActions(TrackRow row)
+    {
+        if (!CanEdit || row.PlaylistSetVideoId is not { } setId || _playlistSession is not { } session
+            || _playlist?.Playlist.Id is not { } id) yield break;
+
+        yield return SongMenu.Item("Remove from this playlist", "\uE74D", () =>
+            _ = RunEditAsync(session, () => App.Account.RemovePlaylistTrackAsync(session, id, row.Song.Id, setId)));
+
+        var index = _rows.IndexOf(row);
+        if (index > 0 && _rows[index - 1].PlaylistSetVideoId is { } previous)
+        {
+            yield return SongMenu.Item("Move up", "\uE74A", () =>
+                _ = RunEditAsync(session, () => App.Account.MovePlaylistTrackAsync(session, id, setId, previous)));
+        }
+        if (index >= 0 && (index + 1 < _rows.Count
+                ? _rows[index + 1].PlaylistSetVideoId is not null
+                : _continuation is not null))
+        {
+            yield return SongMenu.Item("Move down", "\uE74B", () => _ = MoveDownAsync(row, session, id));
+        }
+    }
+
+    private async Task MoveDownAsync(TrackRow row, string session, string id)
+    {
+        if (_rows.IndexOf(row) == _rows.Count - 1) await LoadMoreAsync();
+        var index = _rows.IndexOf(row);
+        if (index >= 0 && index + 1 < _rows.Count && row.PlaylistSetVideoId is { } setId
+            && _rows[index + 1].PlaylistSetVideoId is { } next)
+        {
+            // Moving the next row before this one also works across a page boundary.
+            await RunEditAsync(session, () => App.Account.MovePlaylistTrackAsync(session, id, next, setId));
+        }
+    }
+
+    private async void OnRenameClick(object sender, RoutedEventArgs e)
+    {
+        if (!CanEdit || _playlistSession is not { } session || _playlist?.Playlist is not { } playlist) return;
+        var title = await Dialogs.AskYouTubePlaylistNameAsync(playlist.Title);
+        if (title is not null && title != playlist.Title)
+            await RunEditAsync(session, () => App.Account.RenamePlaylistAsync(session, playlist.Id, title));
+    }
+
+    private async Task RunEditAsync(string session, Func<Task> edit)
+    {
+        if (!CanEdit || _playlistSession != session) return;
+        _editing = true;
+        UpdateEdit();
+        try
+        {
+            await edit();
+            App.Shell?.Note("Playlist updated on YouTube Music.");
+        }
+        catch (Exception error)
+        {
+            App.Shell?.Note($"Couldn't update the YouTube Music playlist. {Errors.Describe(error)}");
+        }
+        finally
+        {
+            _editing = false;
+            UpdateEdit();
+        }
+    }
+
+    private void OnPlaylistEdited(string id) => DispatcherQueue.TryEnqueue(() =>
+    {
+        if (_active && _playlist?.Playlist.Id == id && _playlistSession == App.Account.PlaylistSession)
+            _ = LoadAsync(fresh: true);
+    });
+
+    private void OnAccountChanged() => DispatcherQueue.TryEnqueue(UpdateEdit);
+
+    private void UpdateEdit()
+    {
+        RenameButton.Visibility = _playlist is { CanEdit: true } && _playlistSession is { } session
+            && App.Account.PlaylistSession == session ? Visibility.Visible : Visibility.Collapsed;
+        RenameButton.IsEnabled = CanEdit;
+    }
+
+    private void UpdateEmpty()
+    {
+        EmptyText.Visibility = _songs.Count == 0 && _continuation is null ? Visibility.Visible : Visibility.Collapsed;
+        EmptyText.Text = _playlist is { CanEdit: true }
+            ? "This playlist is empty. Open any song's menu and choose Add to playlist, then YouTube Music."
+            : "This playlist is empty.";
+    }
+
+    private void OnLibraryChanged() => DispatcherQueue.TryEnqueue(() =>
+    {
+        UpdateSave();
+        UpdatePin();
+    });
+
+    private void UpdatePin()
+    {
+        if (Source is { } playlist) PinButton.Content = Navigator.PinLabel(playlist);
+    }
+
+    private void OnPinClick(object sender, RoutedEventArgs e)
+    {
+        if (Source is { } playlist) Navigator.TogglePin(playlist);
+    }
 
     private void UpdateSave()
     {

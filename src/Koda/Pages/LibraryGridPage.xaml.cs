@@ -5,6 +5,7 @@ using Koda.Core;
 using Koda.Helpers;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Navigation;
 
 namespace Koda.Pages;
@@ -22,6 +23,7 @@ public sealed partial class LibraryGridPage : Page
     public LibraryGridPage()
     {
         InitializeComponent();
+        Cards.ContextRequested += OnCardContext;
         App.Library.Changed += OnLibraryChanged;
         Unloaded += (_, _) => App.Library.Changed -= OnLibraryChanged;
     }
@@ -168,6 +170,24 @@ public sealed partial class LibraryGridPage : Page
         {
             Navigator.Open(card.Item);
         }
+    }
+
+    private void OnCardContext(UIElement sender, ContextRequestedEventArgs e)
+    {
+        if (e.OriginalSource is not FrameworkElement { DataContext: CardItem card }) return;
+        var playlist = card.Item switch
+        {
+            MusicItem.PlaylistRecord remote => PlaylistReference.From(remote.Value),
+            MusicItem.UserPlaylistRecord local => PlaylistReference.From(local.Value),
+            _ => null,
+        };
+        if (playlist is null) return;
+
+        var menu = new MenuFlyout();
+        menu.Items.Add(Navigator.PinItem(playlist));
+        if (e.TryGetPosition(Cards, out var position)) menu.ShowAt(Cards, position);
+        else menu.ShowAt(Cards);
+        e.Handled = true;
     }
 
     private void OnNewPlaylistClick(object sender, RoutedEventArgs e) => _ = Dialogs.CreatePlaylistAsync([]);

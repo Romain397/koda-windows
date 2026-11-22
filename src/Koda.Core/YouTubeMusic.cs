@@ -172,25 +172,25 @@ public sealed partial class YouTubeMusic : IDisposable
         return page;
     }
 
-    public Task<PlaylistPage> PlaylistAsync(string id, CancellationToken cancellation = default) =>
-        Page($"playlist|{id}", async () => await FetchPlaylistAsync(id, cancellation));
+    public Task<PlaylistPage> PlaylistAsync(string id, CancellationToken cancellation = default, bool fresh = false)
+    {
+        id = Pages.PlaylistId(id);
+        return fresh ? FetchPlaylistAsync(id, cancellation) : Page($"playlist|{id}", () => FetchPlaylistAsync(id, cancellation));
+    }
 
     private async Task<PlaylistPage> FetchPlaylistAsync(string id, CancellationToken cancellation)
     {
-        var browseId = id.StartsWith("VL") ? id : "VL" + id;
-        var root = await _api.MusicAsync("browse", new JsonObject { ["browseId"] = browseId }, cancellation);
-        return Pages.Playlist(root, id.StartsWith("VL") ? id[2..] : id)
-            ?? throw MusicException.BadResponse(200);
+        var root = await _api.MusicAsync("browse", new JsonObject { ["browseId"] = "VL" + id }, cancellation);
+        return Pages.Playlist(root, id) ?? throw MusicException.BadResponse(200);
     }
 
     /// <summary>The next page of a playlist's tracks.</summary>
-    public async Task<QueuePage> PlaylistMoreAsync(string continuation, CancellationToken cancellation = default)
+    public async Task<PlaylistTrackPage> PlaylistMoreAsync(string continuation, CancellationToken cancellation = default)
     {
         var root = await _api.MusicAsync("browse",
             new JsonObject { ["continuation"] = continuation }, cancellation);
         var next = Pages.PlaylistContinuation(root);
-        var songs = Pages.PlaylistSongs(root);
-        return new QueuePage(songs, next == continuation ? null : next);
+        return new PlaylistTrackPage(Pages.PlaylistTracks(root), next == continuation ? null : next);
     }
 
     /// <summary>Every track of a playlist, following continuations.</summary>
@@ -203,7 +203,7 @@ public sealed partial class YouTubeMusic : IDisposable
         while (token is { } current && songs.Count < limit && seen.Add(current))
         {
             var page = await PlaylistMoreAsync(current, cancellation);
-            songs.AddRange(page.Songs);
+            songs.AddRange(page.Tracks.Select(track => track.Song));
             token = page.Continuation;
         }
         return [.. songs];

@@ -15,6 +15,28 @@ public static class Navigator
 {
     public static void Go(Type page, object? parameter = null) => App.Shell?.NavigateTo(page, parameter);
 
+    public static string PlaylistTag(PlaylistReference playlist) =>
+        playlist.IsLocal ? $"playlist:{playlist.Id}" : $"yt-playlist:{playlist.Id}";
+
+    public static void OpenPlaylist(PlaylistReference playlist)
+    {
+        if (!playlist.IsLocal) Go(typeof(Pages.PlaylistPage), playlist.Id);
+        else if (Guid.TryParse(playlist.Id, out var id)) Go(typeof(Pages.UserPlaylistPage), id);
+    }
+
+    public static string PinLabel(PlaylistReference playlist) =>
+        App.Library.IsPinned(playlist) ? "Unpin from sidebar" : "Pin to sidebar";
+
+    public static void TogglePin(PlaylistReference playlist)
+    {
+        var pinned = !App.Library.IsPinned(playlist);
+        App.Library.SetPlaylistPinned(playlist, pinned);
+        App.Shell?.Note(pinned ? $"Pinned {playlist.Title} to the sidebar." : $"Unpinned {playlist.Title}.");
+    }
+
+    public static MenuFlyoutItem PinItem(PlaylistReference playlist) => SongMenu.Item(PinLabel(playlist),
+        App.Library.IsPinned(playlist) ? "\uE77A" : "\uE718", () => TogglePin(playlist));
+
     /// <summary>A song plays inside <paramref name="queue"/>; a collection opens its page.</summary>
     public static void Open(MusicItem item, IReadOnlyList<Song>? queue = null)
     {
@@ -48,7 +70,9 @@ public static class SongMenu
     /// <summary>Hook a list whose items are songs (or rows/cards holding one); <paramref name="queue"/>
     /// is what "Play now" plays into. <paramref name="extra"/> adds the page's own actions at the foot.</summary>
     public static void Attach(UIElement list, Func<IReadOnlyList<Song>> queue,
-        Func<Song, IEnumerable<MenuFlyoutItemBase>>? extra = null) =>
+        Func<Song, IEnumerable<MenuFlyoutItemBase>>? extra = null,
+        Func<TrackRow, IEnumerable<MenuFlyoutItemBase>>? rowActions = null,
+        Func<PlaylistReference?>? playlist = null) =>
         list.ContextRequested += (sender, args) =>
         {
             if (args.OriginalSource is not FrameworkElement { DataContext: var context } || SongOf(context) is not { } song)
@@ -56,7 +80,8 @@ public static class SongMenu
                 return;
             }
 
-            var menu = Build(song, queue(), extra?.Invoke(song));
+            var actions = context is TrackRow row && rowActions is not null ? rowActions(row) : extra?.Invoke(song);
+            var menu = Build(song, queue(), actions, playlist?.Invoke());
             var host = (FrameworkElement)sender;
             if (args.TryGetPosition(host, out var position))
             {
@@ -79,12 +104,13 @@ public static class SongMenu
         _ => null,
     };
 
-    public static MenuFlyout Build(Song song, IReadOnlyList<Song> queue, IEnumerable<MenuFlyoutItemBase>? extra = null)
+    public static MenuFlyout Build(Song song, IReadOnlyList<Song> queue, IEnumerable<MenuFlyoutItemBase>? extra = null,
+        PlaylistReference? playlist = null)
     {
         var menu = new MenuFlyout();
-        menu.Items.Add(Item("Play now", "\uE768", () => _ = PlaybackService.Instance.PlayNowAsync(song, queue.Count > 0 ? queue : [song])));
-        menu.Items.Add(Item("Add to queue", "\uE71C", () => PlaybackService.Instance.AddToQueue([song])));
-        menu.Items.Add(Item("Play next", "\uE8A5", () => _ = PlaybackService.Instance.PlayNextAsync(song)));
+        menu.Items.Add(Item("Play now", "\uE768", () => _ = PlaybackService.Instance.PlayNowAsync(song, queue.Count > 0 ? queue : [song], playlist)));
+        menu.Items.Add(Item("Add to queue", "\uE71C", () => PlaybackService.Instance.AddToQueue([song], playlist: playlist)));
+        menu.Items.Add(Item("Play next", "\uE8A5", () => _ = PlaybackService.Instance.PlayNextAsync(song, playlist)));
         menu.Items.Add(Item("Start radio", "\uE8FE", () => _ = PlaybackService.Instance.StartRadioAsync(song)));
         menu.Items.Add(new MenuFlyoutSeparator());
         var liked = App.Library.IsLiked(song);
@@ -197,6 +223,10 @@ public static class SongMenu
         submenu.Items.Add(Item(songs.Count == 1 ? "New playlist…" : "New playlist…", "\uE710",
             () => _ = Dialogs.CreatePlaylistAsync(songs)));
         var playlists = App.Library.UserPlaylists;
+        if (App.Account.PlaylistSession is { } session && songs.Count > 0)
+        {
+            submenu.Items.Add(Item("YouTube Music…", "\uE8FD", () => _ = Dialogs.AddToYouTubeMusicPlaylistAsync(session, songs)));
+        }
         if (playlists.Length == 0)
         {
             return submenu;

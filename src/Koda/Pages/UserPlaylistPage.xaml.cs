@@ -26,10 +26,17 @@ public sealed partial class UserPlaylistPage : Page
     public UserPlaylistPage()
     {
         InitializeComponent();
-        SongMenu.Attach(Tracks, () => _songs, RowActions);
+        SongMenu.Attach(Tracks, () => _songs, RowActions, playlist: () => Source);
         App.Library.Changed += OnLibraryChanged;
-        Unloaded += (_, _) => App.Library.Changed -= OnLibraryChanged;
+        PlaylistCovers.Changed += OnCoverChanged;
+        Unloaded += (_, _) =>
+        {
+            App.Library.Changed -= OnLibraryChanged;
+            PlaylistCovers.Changed -= OnCoverChanged;
+        };
     }
+
+    private PlaylistReference? Source => _playlist is { } playlist ? PlaylistReference.From(playlist) : null;
 
     protected override void OnNavigatedTo(NavigationEventArgs args)
     {
@@ -43,6 +50,13 @@ public sealed partial class UserPlaylistPage : Page
     }
 
     private void OnLibraryChanged() => DispatcherQueue.TryEnqueue(Render);
+
+    private void OnCoverChanged(PlaylistReference changed) => DispatcherQueue.TryEnqueue(() =>
+    {
+        if (_playlist is not { } playlist || !PlaylistReference.From(playlist).SamePlaylist(changed)) return;
+        BuildMosaic(playlist);
+        BuildMore(playlist);
+    });
 
     private void Render()
     {
@@ -60,7 +74,7 @@ public sealed partial class UserPlaylistPage : Page
         HeroTitle.Text = playlist.Name;
         HeroDetail.Text = Format.SongList(_songs);
         Tracks.ItemsSource = playlist.Songs.Select((s, i) => new TrackRow(i + 1, s)).ToArray();
-        BuildMosaic(_songs);
+        BuildMosaic(playlist);
 
         var any = _songs.Length > 0;
         PlayButton.Visibility = ShuffleButton.Visibility = any ? Visibility.Visible : Visibility.Collapsed;
@@ -74,7 +88,7 @@ public sealed partial class UserPlaylistPage : Page
         BuildMore(playlist);
     }
 
-    private void BuildMosaic(Song[] songs)
+    private void BuildMosaic(UserPlaylist playlist)
     {
         // Keep the fallback glyph at the back; the covers go over it.
         while (Mosaic.Children.Count > 1)
@@ -82,9 +96,15 @@ public sealed partial class UserPlaylistPage : Page
             Mosaic.Children.RemoveAt(1);
         }
 
+        if (PlaylistCovers.ImageFor(PlaylistReference.From(playlist), 200, customOnly: true) is { } cover)
+        {
+            ShowSingleCover(new Image { Source = cover, Stretch = Stretch.UniformToFill });
+            return;
+        }
+
         // Distinct covers, as the Mac shows them: four tile the square, fewer is the first one whole.
         var seen = new HashSet<string>();
-        var art = songs.Select(s => s.Artwork).OfType<Artwork>()
+        var art = playlist.Songs.Select(s => s.Artwork).OfType<Artwork>()
             .Where(a => seen.Add(a.Url.ToString()))
             .Take(4)
             .ToArray();
@@ -99,16 +119,9 @@ public sealed partial class UserPlaylistPage : Page
         MosaicGlyph.Foreground = (Brush)Application.Current.Resources["TextFillColorTertiaryBrush"];
         if (art.Length < 4)
         {
-            var single = new Border
-            {
-                CornerRadius = new CornerRadius(16),
-                Background = (Brush)Application.Current.Resources["SubtleFillColorSecondaryBrush"],
-                Child = new Image { Stretch = Stretch.UniformToFill },
-            };
-            Art.SetSource((Image)single.Child, art[0]);
-            Grid.SetColumnSpan(single, 2);
-            Grid.SetRowSpan(single, 2);
-            Mosaic.Children.Add(single);
+            var image = new Image { Stretch = Stretch.UniformToFill };
+            Art.SetSource(image, art[0]);
+            ShowSingleCover(image);
             return;
         }
 
@@ -135,6 +148,16 @@ public sealed partial class UserPlaylistPage : Page
         }
     }
 
+    private void ShowSingleCover(Image image)
+    {
+        MosaicTile.Background = (Brush)Application.Current.Resources["SubtleFillColorSecondaryBrush"];
+        MosaicGlyph.Foreground = (Brush)Application.Current.Resources["TextFillColorTertiaryBrush"];
+        var tile = new Border { CornerRadius = new CornerRadius(16), Child = image };
+        Grid.SetColumnSpan(tile, 2);
+        Grid.SetRowSpan(tile, 2);
+        Mosaic.Children.Add(tile);
+    }
+
     /// <summary>The Mac's empty playlist cover: the accent fading away behind a white note.</summary>
     private static Brush AccentGradient()
     {
@@ -154,14 +177,17 @@ public sealed partial class UserPlaylistPage : Page
     private void BuildMore(UserPlaylist playlist)
     {
         var menu = new MenuFlyout();
+        var source = PlaylistReference.From(playlist);
         var hasSongs = playlist.Songs.Length > 0;
-        var playNext = SongMenu.Item("Play next", "\uE8A5", () => _ = PlaybackService.Instance.PlayNextAsync(playlist.Songs[0]));
+        var playNext = SongMenu.Item("Play next", "\uE8A5", () => _ = PlaybackService.Instance.PlayNextAsync(playlist.Songs[0], source));
         playNext.IsEnabled = hasSongs;
         menu.Items.Add(playNext);
-        var queue = SongMenu.Item("Add to queue", "\uE71C", () => PlaybackService.Instance.AddToQueue(playlist.Songs));
+        var queue = SongMenu.Item("Add to queue", "\uE71C", () => PlaybackService.Instance.AddToQueue(playlist.Songs, playlist: source));
         queue.IsEnabled = hasSongs;
         menu.Items.Add(queue);
         menu.Items.Add(new MenuFlyoutSeparator());
+        menu.Items.Add(Navigator.PinItem(source));
+        PlaylistCovers.AddMenuItems(menu, source);
         menu.Items.Add(SongMenu.Item("Rename…", "\uE70F", () => _ = Dialogs.RenamePlaylistAsync(playlist)));
         var delete = SongMenu.Item($"Delete playlist…", "\uE74D", () => _ = DeleteAsync(playlist));
         menu.Items.Add(delete);
@@ -206,7 +232,7 @@ public sealed partial class UserPlaylistPage : Page
     {
         if (e.ClickedItem is TrackRow row)
         {
-            _ = PlaybackService.Instance.PlayNowAsync(row.Song, _songs);
+            _ = PlaybackService.Instance.PlayNowAsync(row.Song, _songs, Source);
         }
     }
 
@@ -214,9 +240,9 @@ public sealed partial class UserPlaylistPage : Page
     {
         if (_songs.Length > 0)
         {
-            _ = PlaybackService.Instance.PlayNowAsync(_songs[0], _songs);
+            _ = PlaybackService.Instance.PlayNowAsync(_songs[0], _songs, Source);
         }
     }
 
-    private void OnShuffleClick(object sender, RoutedEventArgs e) => _ = PlaybackService.Instance.ShuffleAsync(_songs);
+    private void OnShuffleClick(object sender, RoutedEventArgs e) => _ = PlaybackService.Instance.ShuffleAsync(_songs, Source);
 }

@@ -225,8 +225,16 @@ public record PlaylistPage(
     string? Author,
     string? DetailLine,
     string? Description,
-    Song[] Songs,
-    string? Continuation);
+    PlaylistTrack[] Tracks,
+    string? Continuation,
+    bool CanEdit = false)
+{
+    public Song[] Songs => [.. Tracks.Select(track => track.Song)];
+}
+
+public record PlaylistTrack(Song Song, string? SetVideoId = null);
+
+public record PlaylistTrackPage(PlaylistTrack[] Tracks, string? Continuation);
 
 public record SearchResults(
     MusicItem? Top,

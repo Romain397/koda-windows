@@ -52,6 +52,7 @@ public sealed class PlaybackService
     private bool _loaded;
     private bool _resolving;
     private bool _wantsToPlay;
+    private bool _stopped;
     private bool _failedOnce;
     /// <summary>Seconds of sound since the last retry.</summary>
     private double _heardSinceRetry;
@@ -104,6 +105,10 @@ public sealed class PlaybackService
     public event Action<QueueItem, double>? ItemHeard;
 
     public Song? CurrentSong => _queue.Current?.Song;
+
+    public PlaylistReference? CurrentPlaylist => !Profiles.IsSwitching
+        && _queue.Current?.Source is { } source && source.ProfileKey == Profiles.ActiveKey
+        ? App.Library.ResolvePlaylist(source.Playlist) : null;
     public Song? NextSong => _queue.PeekNext(automatic: false)?.Song;
 
     public PlayQueue Queue => _queue;
@@ -167,6 +172,11 @@ public sealed class PlaybackService
         _sleepTimer.Tick += (_, _) => TickSleep();
 
         RestoreQueue();
+        if (CurrentSong is { } restored)
+        {
+            UpdateSmtcTrack(restored);
+            _smtc.SetTimeline(PositionSeconds, DurationSeconds);
+        }
         _ = RestoreAudioDeviceAsync();
     }
 
@@ -188,7 +198,7 @@ public sealed class PlaybackService
         }
 
         PlayStateChanged?.Invoke();
-        _smtc?.UpdatePlaybackState(state == MediaPlayerState.Playing);
+        _smtc?.UpdatePlaybackState(_wantsToPlay && state == MediaPlayerState.Playing, _stopped);
     }
 
     private void OnPositionTimer()
@@ -271,25 +281,28 @@ public sealed class PlaybackService
 
     // MARK: starting things
 
+    private static PlaylistSource? SourceOf(PlaylistReference? playlist) =>
+        playlist is null ? null : new PlaylistSource(Profiles.ActiveKey, playlist);
+
     /// <summary>Play a song now, adopting <paramref name="context"/> as the queue around it.</summary>
-    public Task PlayNowAsync(Song song, IReadOnlyList<Song> context)
+    public Task PlayNowAsync(Song song, IReadOnlyList<Song> context, PlaylistReference? playlist = null)
     {
         var list = context.Count > 0 ? context : [song];
         var index = Math.Max(0, list.ToList().FindIndex(s => s.Id == song.Id));
-        _queue.Replace(list, index); // repeat stays with the listener, not the list
+        _queue.Replace(list, index, source: SourceOf(playlist)); // repeat stays with the listener, not the list
         QueueChanged?.Invoke();
         return PlayCurrentAsync();
     }
 
     /// <summary>The songs in a shuffled order (the queue's shuffle on).</summary>
-    public Task ShuffleAsync(IReadOnlyList<Song> songs)
+    public Task ShuffleAsync(IReadOnlyList<Song> songs, PlaylistReference? playlist = null)
     {
         if (songs.Count == 0)
         {
             return Task.CompletedTask;
         }
 
-        _queue.Replace(songs, Random.Shared.Next(songs.Count), shuffled: true);
+        _queue.Replace(songs, Random.Shared.Next(songs.Count), shuffled: true, source: SourceOf(playlist));
         QueueChanged?.Invoke();
         return PlayCurrentAsync();
     }
@@ -337,14 +350,14 @@ public sealed class PlaybackService
     }
 
     /// <summary>Queue songs right after the current one; with nothing playing they start instead.</summary>
-    public Task PlayNextAsync(Song song)
+    public Task PlayNextAsync(Song song, PlaylistReference? playlist = null)
     {
         if (CurrentSong is null)
         {
-            return PlayNowAsync(song, [song]);
+            return PlayNowAsync(song, [song], playlist);
         }
 
-        _queue.PlayNext([song]);
+        _queue.PlayNext([song], SourceOf(playlist));
         QueueEdited();
         TrackChanged?.Invoke(); // Next becomes available
         StatusRaised?.Invoke(StatusTone.Pacing, $"Playing next: {song.Title}");
@@ -352,15 +365,15 @@ public sealed class PlaybackService
     }
 
     /// <summary>Songs to the end of the queue.</summary>
-    public void AddToQueue(IReadOnlyList<Song> songs, bool announce = true)
+    public void AddToQueue(IReadOnlyList<Song> songs, bool announce = true, PlaylistReference? playlist = null)
     {
         if (CurrentSong is null && songs.Count > 0)
         {
-            _ = PlayNowAsync(songs[0], songs);
+            _ = PlayNowAsync(songs[0], songs, playlist);
             return;
         }
 
-        _queue.Append(songs);
+        _queue.Append(songs, SourceOf(playlist));
         QueueEdited();
         if (announce) StatusRaised?.Invoke(StatusTone.Pacing, songs.Count == 1 ? $"Added to queue: {songs[0].Title}" : $"Added {songs.Count} songs to the queue");
     }
@@ -392,6 +405,7 @@ public sealed class PlaybackService
         }
 
         PlayStateChanged?.Invoke();
+        _smtc?.UpdatePlaybackState(_wantsToPlay && _player.State == MediaPlayerState.Playing, _stopped);
     }
 
     /// <summary>Stops the songs, for a video taking the sound (the video player calls this).</summary>
@@ -404,6 +418,28 @@ public sealed class PlaybackService
     public void Play()
     {
         if (!_wantsToPlay && CurrentSong is not null) Toggle();
+    }
+
+    /// <summary>Stop at the beginning of the current song and keep the queue ready to resume.</summary>
+    public void Stop()
+    {
+        if (CurrentSong is null) return;
+
+        ++_generation;
+        ++_nextGeneration;
+        _wantsToPlay = false;
+        _stopped = true;
+        _loaded = false;
+        _resolving = false;
+        _resumeAt = 0;
+        _currentStream = null;
+        _stalledSince = null;
+        _player.Stop();
+        SaveQueue();
+        _smtc?.UpdatePlaybackState(playing: false, stopped: true);
+        _smtc?.SetTimeline(0, DurationSeconds);
+        PlayStateChanged?.Invoke();
+        PositionTick?.Invoke();
     }
 
     /// <summary>With no speakers or headphones connected there is nothing to play through: the
@@ -709,6 +745,7 @@ public sealed class PlaybackService
         var song = item.Song;
         if (_listeningItem != item.Id) SetListeningProfile(item);
         var generation = ++_generation;
+        _stopped = false;
         // The old song leaves now, not when the new one has resolved: a skip is heard at once.
         var fadeIn = fade && _player.FadesSkips ? Player.SkipFadeSeconds : 0;
         _player.Leave(fadeIn);
@@ -763,7 +800,8 @@ public sealed class PlaybackService
         // song must not sound its first second before it moves.
         _player.Load(stream, song, item.Id, resumeAt, fadeIn);
         _loaded = true;
-        _player.Play();
+        if (_wantsToPlay) _player.Play();
+        else _resolving = false;
         BeganSong(song);
     }
 
@@ -815,7 +853,7 @@ public sealed class PlaybackService
         _smtc?.UpdateTrack(song.Title, song.ArtistLine, song.Artwork?.Resized(96)?.ToString());
         _smtc?.SetTimeline(0, song.Duration ?? 0);
         _smtc?.UpdatePlaybackState(false);
-        _smtc?.SetTransport(CanPrev, CanNext);
+        _smtc?.SetTransport(true, CanPrev, CanNext);
     }
 
     /// <summary>Tell Last.fm the current song started, once per play.</summary>
@@ -916,11 +954,12 @@ public sealed class PlaybackService
         _extending = true;
         QueueChanged?.Invoke();
         var anchor = _queue.Current?.Id;
+        var generation = _generation;
         var last = _queue.Items[^1].Song;
         try
         {
             var radio = await EngineHost.Music.RadioAsync(last.Id);
-            if (_queue.Current?.Id != anchor)
+            if (_queue.Current?.Id != anchor || generation != _generation)
             {
                 return;
             }
@@ -958,6 +997,7 @@ public sealed class PlaybackService
 
     private async Task OnEndedAsync()
     {
+        if (_stopped) return;
         // A player that runs out of samples says "ended" for two reasons: the song
         // finished, or the bytes stopped coming (a refused range, a stall). Only the
         // second one must not move the queue on - otherwise the listener loses the
@@ -1039,7 +1079,7 @@ public sealed class PlaybackService
 
     private async Task RecoverAsync(string reason)
     {
-        if (CurrentSong is not { } song)
+        if (_stopped || CurrentSong is not { } song)
         {
             return;
         }

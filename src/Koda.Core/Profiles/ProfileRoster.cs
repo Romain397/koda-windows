@@ -180,6 +180,7 @@ public sealed class ProfileRoster
                     var path = Path.Combine(_root, file);
                     if (File.Exists(path)) File.Delete(path);
                 }
+                new PlaylistCoverStore(_root).RemoveAll();
             }
             else
             {

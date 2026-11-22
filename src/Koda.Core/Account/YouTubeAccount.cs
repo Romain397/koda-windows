@@ -69,6 +69,7 @@ public sealed class YouTubeAccount : IDisposable
 
     /// <summary>Raised when what the Settings page shows changes: signed in, expired, syncing.</summary>
     public event Action? Changed;
+    public event Action<string>? PlaylistEdited;
 
     /// <summary>Who is signed in, once the account menu has answered (or a previous run saved it).</summary>
     public AccountInfo? Info => _info;
@@ -79,6 +80,51 @@ public sealed class YouTubeAccount : IDisposable
     public bool IsExpired => _isExpired;
 
     public bool IsSyncing => _isSyncing;
+
+    public string? PlaylistSession => !IsExpired && _music.Accounts.CacheScope is { Length: > 0 } scope ? scope : null;
+
+    public async Task<PlaylistSummary[]> EditablePlaylistsAsync(string session, string videoId, CancellationToken cancellation = default)
+    {
+        CheckPlaylistSession(session);
+        var playlists = await _music.EditablePlaylistsAsync(videoId, cancellation);
+        CheckPlaylistSession(session);
+        return playlists;
+    }
+
+    public Task AddPlaylistSongsAsync(string session, string id, IReadOnlyList<Song> songs) =>
+        EditPlaylistAsync(session, id, token => _music.AddPlaylistSongsAsync(id, songs, token));
+
+    public Task RemovePlaylistTrackAsync(string session, string id, string videoId, string setVideoId) =>
+        EditPlaylistAsync(session, id, token => _music.RemovePlaylistTrackAsync(id, videoId, setVideoId, token));
+
+    public Task MovePlaylistTrackAsync(string session, string id, string setVideoId, string beforeSetVideoId) =>
+        EditPlaylistAsync(session, id, token => _music.MovePlaylistTrackAsync(id, setVideoId, beforeSetVideoId, token));
+
+    public Task RenamePlaylistAsync(string session, string id, string title) => EditPlaylistAsync(session, id, async token =>
+    {
+        await _music.RenamePlaylistAsync(id, title, token);
+        _library.UpdateSavedPlaylistTitle(Parsing.Pages.PlaylistId(id), title);
+    });
+
+    private async Task EditPlaylistAsync(string session, string id, Func<CancellationToken, Task> edit)
+    {
+        await _work.WaitAsync(_stopping.Token);
+        try
+        {
+            CheckPlaylistSession(session);
+            await edit(_stopping.Token);
+        }
+        finally
+        {
+            _work.Release();
+        }
+        PlaylistEdited?.Invoke(Parsing.Pages.PlaylistId(id));
+    }
+
+    private void CheckPlaylistSession(string session)
+    {
+        if (PlaylistSession is not { } current || current != session) throw MusicException.SignedOut();
+    }
 
     /// <summary>At launch: the saved session, then the account's library, then a sync every quarter hour.</summary>
     public void Start()

@@ -85,11 +85,38 @@
             </Grid.ColumnDefinitions>
 
             <!-- Top bar: close, the mini player, and the song's menu. -->
-            <Grid Grid.ColumnSpan="2" Height="48">
+            <Grid Grid.ColumnSpan="2" Height="48" ColumnSpacing="8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
                 <Button Style="{StaticResource PlayerGlyphButton}" Width="44" Height="44" Click="OnCloseClick" ToolTipService.ToolTip="Close (Esc)" AutomationProperties.Name="Close Now Playing">
                     <FontIcon Glyph="&#xE70D;" FontSize="16" />
                 </Button>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Spacing="2">
+                <Button x:Name="PlaylistOriginButton" Grid.Column="1" MaxWidth="360" Height="38" Padding="10,0"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" HorizontalContentAlignment="Stretch"
+                        CornerRadius="8" Background="#28FFFFFF" BorderThickness="0" Visibility="Collapsed"
+                        Click="OnPlaylistOriginClick">
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Border Width="26" Height="26" VerticalAlignment="Center" CornerRadius="4" Background="#28FFFFFF">
+                            <Grid>
+                                <FontIcon Glyph="&#xE8FD;" FontSize="13" Foreground="#B3FFFFFF" />
+                                <Image x:Name="PlaylistOriginArt" Stretch="UniformToFill" />
+                            </Grid>
+                        </Border>
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                            <TextBlock Text="Playing from" FontSize="10" Foreground="#B3FFFFFF" />
+                            <TextBlock x:Name="PlaylistOriginName" FontSize="13" FontWeight="SemiBold"
+                                       TextTrimming="CharacterEllipsis" TextWrapping="NoWrap" />
+                        </StackPanel>
+                    </Grid>
+                </Button>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" HorizontalAlignment="Right" Spacing="2">
                     <Button
                         x:Name="SleepPill"
                         Style="{StaticResource PlayerGlyphButton}"

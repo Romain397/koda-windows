@@ -51,7 +51,7 @@ public sealed record ShelfView(string Title, string? Strapline, CardItem[] Cards
 }
 
 /// <summary>A numbered track row (album and playlist tables).</summary>
-public sealed record TrackRow(int Number, Song Song)
+public sealed record TrackRow(int Number, Song Song, string? PlaylistSetVideoId = null)
 {
     public string Title => Song.Title;
     public string ArtistLine => Song.ArtistLine;

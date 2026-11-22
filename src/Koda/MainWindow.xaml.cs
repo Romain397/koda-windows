@@ -19,11 +19,13 @@ using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Windows.Graphics;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Media;
 using CoreVirtualKeyStates = Windows.UI.Core.CoreVirtualKeyStates;
 using VirtualKey = Windows.System.VirtualKey;
 using VirtualKeyModifiers = Windows.System.VirtualKeyModifiers;
 using YouTubeLink = Koda.Core.YouTubeLink;
+using PlaylistReference = Koda.Core.PlaylistReference;
 
 namespace Koda;
 
@@ -45,6 +47,7 @@ public sealed partial class MainWindow : Window
     /// <summary>The title bar's own content follows the UI zoom, but not below 75%:
     /// a back button and a search field still have to be usable.</summary>
     private const double TitleBarMinScale = 0.75;
+    private const string PinDragFormat = "Koda.PlaylistPin";
 
     private TrayIconHost? _tray;
     private Taskbar? _taskbar;
@@ -59,6 +62,8 @@ public sealed partial class MainWindow : Window
     private string _playlistSignature = "";
     private bool _hasUpNext;
     private readonly List<NavigationViewItem> _playlistItems = [];
+    private PinDrag? _pinDrag;
+    private sealed record PinDrag(PlaylistReference Playlist, string Profile);
     private DispatcherQueueTimer? _volumeSaveTimer;
     private DispatcherQueueTimer? _statusTimer;
     private DispatcherQueueTimer? _suggestTimer;
@@ -108,7 +113,7 @@ public sealed partial class MainWindow : Window
         _previousWndProc = Win32.SetWindowLongPtr(
             hwnd, Win32.GWLP_WNDPROC, Marshal.GetFunctionPointerForDelegate(SubclassedProc));
 
-        _smtc.Bind(hwnd, OnSmtcButton);
+        _smtc.Bind(hwnd, DispatcherQueue, OnSmtcButton);
         _taskbar = new Taskbar(hwnd,
             () => _ = Playback.PreviousAsync(),
             Playback.Toggle,
@@ -140,10 +145,15 @@ public sealed partial class MainWindow : Window
         App.Account.Changed += () => dispatch.TryEnqueue(UpdateVideoSidebar);
         App.Settings.Changed += _ => dispatch.TryEnqueue(UpdateVideoSidebar);
         UpdateVideoSidebar();
-        Koda.Services.Profiles.Roster.Changed += () => dispatch.TryEnqueue(UpdateProfileItem);
+        Koda.Services.Profiles.Roster.Changed += () => dispatch.TryEnqueue(() =>
+        {
+            UpdateProfileItem();
+            RefreshSidebar();
+        });
         UpdateProfileItem();
         App.Library.Changed += () => dispatch.TryEnqueue(RefreshSidebar);
         App.AudioStore.Changed += () => dispatch.TryEnqueue(RefreshSidebar);
+        PlaylistCovers.Changed += OnPlaylistCoverChanged;
         App.Library.Changed += () => dispatch.TryEnqueue(UpdateLike);
         App.Settings.Changed += _ => dispatch.TryEnqueue(ApplySkipSettings);
 
@@ -414,6 +424,9 @@ public sealed partial class MainWindow : Window
                                 && Guid.TryParse(tag["playlist:".Length..], out var id):
                 NavigateRoot(typeof(UserPlaylistPage), id, tag);
                 break;
+            case not null when tag.StartsWith("yt-playlist:", StringComparison.Ordinal):
+                NavigateRoot(typeof(PlaylistPage), tag["yt-playlist:".Length..], tag);
+                break;
         }
     }
 
@@ -517,7 +530,12 @@ public sealed partial class MainWindow : Window
         },
         nameof(UserPlaylistPage) => parameter is Guid id ? $"playlist:{id}" : null,
         nameof(AlbumPage) => "albums",
-        nameof(PlaylistPage) => "playlists",
+        nameof(PlaylistPage) => parameter switch
+        {
+            string id => $"yt-playlist:{PlaylistReference.YouTubeId(id)}",
+            PlaylistPage.PlaylistRequest request => $"yt-playlist:{PlaylistReference.YouTubeId(request.Id)}",
+            _ => "playlists",
+        },
         nameof(ArtistPage) => "artists",
         nameof(SettingsPage) => "settings",
         nameof(VideoExplorePage) => "video-explore",
@@ -548,6 +566,10 @@ public sealed partial class MainWindow : Window
         {
             Nav.SelectedItem = item;
         }
+        else if (tag.StartsWith("yt-playlist:", StringComparison.Ordinal))
+        {
+            SelectTag("playlists");
+        }
     }
 
     // MARK: sidebar counts and foot
@@ -557,8 +579,16 @@ public sealed partial class MainWindow : Window
         SetBadge(LikedItem, App.Library.Liked.Length);
         SetBadge(DownloadsItem, App.AudioStore.Downloads.Length);
         RebuildPlaylists();
+        UpdatePlaylistPlayback();
         UpdateGlance();
         UpdateUpNext();
+    }
+
+    private void OnPlaylistCoverChanged(PlaylistReference playlist)
+    {
+        _playlistSignature = "";
+        RebuildPlaylists();
+        UpdatePlaylistPlayback();
     }
 
     private static void SetBadge(NavigationViewItem item, int count)
@@ -577,11 +607,17 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    /// <summary>The listener's playlists in the pane, between their header and New Playlist.</summary>
+    /// <summary>Pins appear above the remaining device playlists, which keep their usual access.</summary>
     private void RebuildPlaylists()
     {
-        var playlists = App.Library.UserPlaylists;
-        var signature = string.Join("|", playlists.Select(p => $"{p.Id}:{p.Name}:{p.Songs.Length}:{p.Modified.UtcTicks}"));
+        if (Profiles.IsSwitching) return;
+
+        var library = App.Library;
+        var pins = library.PinnedPlaylists.Select(library.ResolvePlaylist).OfType<PlaylistReference>().ToArray();
+        var local = library.UserPlaylists;
+        var signature = Profiles.ActiveKey + "||"
+            + string.Join("|", pins.Select(p => $"{Navigator.PlaylistTag(p)}:{p.Title}")) + "||"
+            + string.Join("|", local.Select(p => $"{p.Id}:{p.Name}:{p.Songs.Length}:{p.Modified.UtcTicks}"));
         if (signature == _playlistSignature)
         {
             return;
@@ -594,54 +630,142 @@ public sealed partial class MainWindow : Window
         }
 
         _playlistItems.Clear();
+        PinnedPlaylistsHeader.Visibility = pins.Length == 0 ? Visibility.Collapsed : Visibility.Visible;
+        var pinnedAt = Nav.MenuItems.IndexOf(PinnedPlaylistsHeader) + 1;
+        for (var index = 0; index < pins.Length; index++)
+        {
+            var pin = pins[index];
+            var userPlaylist = pin.IsLocal && Guid.TryParse(pin.Id, out var id) ? library.UserPlaylist(id) : null;
+            var item = BuildPlaylistItem(pin, userPlaylist, pinned: true);
+            if (pins.Length > 1) EnablePinReordering(item, pins, index);
+            Nav.MenuItems.Insert(pinnedAt++, item);
+            _playlistItems.Add(item);
+        }
+
         var at = Nav.MenuItems.IndexOf(NewPlaylistItem);
         if (at < 0)
         {
             at = Nav.MenuItems.Count;
         }
 
-        foreach (var playlist in playlists)
+        var pinnedLocalIds = pins.Where(p => p.IsLocal).Select(p => p.Id).ToHashSet();
+        foreach (var playlist in local.Where(p => !pinnedLocalIds.Contains(p.Id.ToString())))
         {
-            var item = BuildPlaylistItem(playlist);
+            var item = BuildPlaylistItem(PlaylistReference.From(playlist), playlist, pinned: false);
             Nav.MenuItems.Insert(at++, item);
             _playlistItems.Add(item);
         }
 
         // A new playlist from a song menu, or a rename: the pane follows the selection.
-        if (_currentTag is { } tag && tag.StartsWith("playlist:", StringComparison.Ordinal))
+        if (_currentTag is { } tag && (tag.StartsWith("playlist:", StringComparison.Ordinal)
+            || tag.StartsWith("yt-playlist:", StringComparison.Ordinal)))
         {
             SelectTag(tag);
         }
     }
 
-    private NavigationViewItem BuildPlaylistItem(Koda.Core.UserPlaylist playlist)
+    private NavigationViewItem BuildPlaylistItem(PlaylistReference source, Koda.Core.UserPlaylist? playlist, bool pinned)
     {
         var item = new NavigationViewItem
         {
-            Content = playlist.Name,
-            Tag = $"playlist:{playlist.Id}",
-            Icon = new FontIcon { Glyph = "\uE8FD" },
+            Content = source.Title,
+            Tag = Navigator.PlaylistTag(source),
+            Icon = new FontIcon { Glyph = pinned ? "\uE718" : "\uE8FD" },
         };
 
+        if (pinned && PlaylistCovers.ImageFor(source, 24) is { } cover)
+        {
+            item.Icon = new ImageIcon { Source = cover, Width = 24, Height = 24 };
+            cover.ImageFailed += (_, _) => item.Icon = new FontIcon { Glyph = "\uE718" };
+        }
+
         var menu = new MenuFlyout();
+        item.ContextFlyout = menu;
+        menu.Items.Add(Navigator.PinItem(source));
+        PlaylistCovers.AddMenuItems(menu, source);
+        if (playlist is null) return item;
+
+        menu.Items.Add(new MenuFlyoutSeparator());
         var play = SongMenu.Item("Play", "\uE768", () =>
         {
             if (playlist.Songs.Length > 0)
             {
-                _ = Playback.PlayNowAsync(playlist.Songs[0], playlist.Songs);
+                _ = Playback.PlayNowAsync(playlist.Songs[0], playlist.Songs, source);
             }
         });
         play.IsEnabled = playlist.Songs.Length > 0;
         menu.Items.Add(play);
-        var queue = SongMenu.Item("Add to queue", "\uE71C", () => Playback.AddToQueue(playlist.Songs));
+        var queue = SongMenu.Item("Add to queue", "\uE71C", () => Playback.AddToQueue(playlist.Songs, playlist: source));
         queue.IsEnabled = playlist.Songs.Length > 0;
         menu.Items.Add(queue);
         menu.Items.Add(new MenuFlyoutSeparator());
         menu.Items.Add(SongMenu.Item("Rename…", "\uE70F", () => _ = Dialogs.RenamePlaylistAsync(playlist)));
         menu.Items.Add(SongMenu.Item("Delete playlist…", "\uE74D", () => _ = DeletePlaylistAsync(playlist)));
-        item.ContextFlyout = menu;
         return item;
     }
+
+    private void EnablePinReordering(NavigationViewItem item, PlaylistReference[] pins, int index)
+    {
+        var pin = pins[index];
+        var profile = Profiles.ActiveKey;
+        item.CanDrag = true;
+        item.AllowDrop = true;
+        item.DragStarting += (_, args) =>
+        {
+            if (!CanReorderPins(profile) || !App.Library.IsPinned(pin))
+            {
+                args.Cancel = true;
+                return;
+            }
+
+            _pinDrag = new PinDrag(pin, profile);
+            args.Data.SetData(PinDragFormat, "pin");
+            args.Data.RequestedOperation = DataPackageOperation.Move;
+        };
+        item.DragOver += (_, args) =>
+        {
+            if (PinForDrop(pin, args) is null) return;
+
+            var after = args.GetPosition(item).Y >= item.ActualHeight / 2;
+            args.AcceptedOperation = DataPackageOperation.Move;
+            args.DragUIOverride.Caption = after ? $"Move after {pin.Title}" : $"Move before {pin.Title}";
+            args.DragUIOverride.IsCaptionVisible = true;
+            args.Handled = true;
+        };
+        item.Drop += (_, args) =>
+        {
+            if (PinForDrop(pin, args) is not { } drag) return;
+
+            var after = args.GetPosition(item).Y >= item.ActualHeight / 2;
+            args.AcceptedOperation = DataPackageOperation.Move;
+            args.Handled = true;
+            _pinDrag = null;
+            App.Library.MovePinnedPlaylist(drag.Playlist, pin, after);
+        };
+        item.DropCompleted += (_, _) => _pinDrag = null;
+
+        var menu = (MenuFlyout)item.ContextFlyout;
+        if (index > 0)
+        {
+            menu.Items.Insert(1, SongMenu.Item("Move pin up", "\uE74A", () =>
+            {
+                if (CanReorderPins(profile)) App.Library.MovePinnedPlaylist(pin, pins[index - 1], after: false);
+            }));
+        }
+        if (index + 1 < pins.Length)
+        {
+            menu.Items.Insert(index > 0 ? 2 : 1, SongMenu.Item("Move pin down", "\uE74B", () =>
+            {
+                if (CanReorderPins(profile)) App.Library.MovePinnedPlaylist(pin, pins[index + 1], after: true);
+            }));
+        }
+    }
+
+    private static bool CanReorderPins(string profile) => !Profiles.IsSwitching && profile == Profiles.ActiveKey;
+
+    private PinDrag? PinForDrop(PlaylistReference target, DragEventArgs args) =>
+        _pinDrag is { } drag && CanReorderPins(drag.Profile) && !drag.Playlist.SamePlaylist(target)
+        && args.DataView.Contains(PinDragFormat) && App.Library.IsPinned(target) ? drag : null;
 
     private async System.Threading.Tasks.Task DeletePlaylistAsync(Koda.Core.UserPlaylist playlist)
     {
@@ -1029,6 +1153,7 @@ public sealed partial class MainWindow : Window
         var song = Playback.CurrentSong;
         TrackTitleText.Text = song?.Title ?? "Nothing playing";
         TrackArtistText.Text = song?.ArtistLine ?? "";
+        UpdatePlaylistPlayback();
         RefreshNextUp();
         Art.SetSource(CoverImage, song?.Artwork);
         CoverGlyph.Visibility = song?.Artwork is null ? Visibility.Visible : Visibility.Collapsed;
@@ -1039,7 +1164,7 @@ public sealed partial class MainWindow : Window
         PreviousButton.IsEnabled = song is not null;
         QueueButton.IsEnabled = MiniButton.IsEnabled = ShuffleButton.IsEnabled = RepeatButton.IsEnabled = song is not null;
         SkipBackButton.IsEnabled = SkipForwardButton.IsEnabled = song is not null && !Playback.IsLoading;
-        _smtc.SetTransport(Playback.CanPrev, Playback.CanNext);
+        _smtc.SetTransport(song is not null, Playback.CanPrev, Playback.CanNext);
         Scrubber.Maximum = Math.Max(1, Playback.DurationSeconds);
         Scrubber.Value = Math.Clamp(Playback.PositionSeconds, 0, Scrubber.Maximum);
         ElapsedText.Text = song is null ? "" : FormatTime(Scrubber.Value);
@@ -1058,6 +1183,36 @@ public sealed partial class MainWindow : Window
             _notifiedSongId = song.Id;
             Notifications.SongChanged(song, Playback.IsPlaying);
         }
+    }
+
+    private void UpdatePlaylistPlayback()
+    {
+        var playlist = Playback.CurrentPlaylist;
+        var label = playlist is null ? "" : $"From {playlist.Title}";
+        PlaylistSourceText.Text = label;
+        PlaylistSourceButton.Visibility = playlist is null ? Visibility.Collapsed : Visibility.Visible;
+        ToolTipService.SetToolTip(PlaylistSourceButton, label);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(PlaylistSourceButton, label);
+
+        var playingTag = Playback.IsPlaying && playlist is not null ? Navigator.PlaylistTag(playlist) : null;
+        foreach (var item in _playlistItems)
+        {
+            if (playingTag is not null && item.Tag as string == playingTag)
+            {
+                item.InfoBadge ??= new InfoBadge { IconSource = new FontIconSource { Glyph = "\uE768" } };
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(item, $"{item.Content}, playing");
+            }
+            else if (item.InfoBadge is not null)
+            {
+                item.InfoBadge = null;
+                Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(item, item.Content as string ?? "");
+            }
+        }
+    }
+
+    private void OnPlaylistSourceClick(object sender, RoutedEventArgs e)
+    {
+        if (Playback.CurrentPlaylist is { } playlist) Navigator.OpenPlaylist(playlist);
     }
 
     /// <summary>What plays after this one; follows the queue as it is shuffled or reordered.</summary>
@@ -1144,6 +1299,7 @@ public sealed partial class MainWindow : Window
 
     private void OnPlayStateChanged()
     {
+        UpdatePlaylistPlayback();
         var playing = Playback.IsPlaying;
         var loading = Playback.IsLoading;
         PlayPauseIcon.Glyph = playing ? "" : "";
@@ -1434,8 +1590,13 @@ public sealed partial class MainWindow : Window
         switch (button)
         {
             case SystemMediaTransportControlsButton.Play:
+                Playback.Play();
+                break;
             case SystemMediaTransportControlsButton.Pause:
-                Playback.Toggle();
+                Playback.Pause();
+                break;
+            case SystemMediaTransportControlsButton.Stop:
+                Playback.Stop();
                 break;
             case SystemMediaTransportControlsButton.Next:
                 _ = Playback.NextAsync();
@@ -1444,6 +1605,36 @@ public sealed partial class MainWindow : Window
                 _ = Playback.PreviousAsync();
                 break;
         }
+    }
+
+    private bool HandleMediaAppCommand(nint parameter)
+    {
+        if (Playback.CurrentSong is null) return false;
+        // GET_APPCOMMAND_LPARAM strips the device bits in the high word.
+        switch (((long)parameter >> 16) & 0x0FFF)
+        {
+            case Win32.APPCOMMAND_MEDIA_PLAY_PAUSE:
+                Playback.Toggle();
+                break;
+            case Win32.APPCOMMAND_MEDIA_PLAY:
+                OnSmtcButton(SystemMediaTransportControlsButton.Play);
+                break;
+            case Win32.APPCOMMAND_MEDIA_PAUSE:
+                OnSmtcButton(SystemMediaTransportControlsButton.Pause);
+                break;
+            case Win32.APPCOMMAND_MEDIA_STOP:
+                OnSmtcButton(SystemMediaTransportControlsButton.Stop);
+                break;
+            case Win32.APPCOMMAND_MEDIA_NEXTTRACK:
+                OnSmtcButton(SystemMediaTransportControlsButton.Next);
+                break;
+            case Win32.APPCOMMAND_MEDIA_PREVIOUSTRACK:
+                OnSmtcButton(SystemMediaTransportControlsButton.Previous);
+                break;
+            default:
+                return false;
+        }
+        return true;
     }
 
     private void OnTrayCommand(uint command)
@@ -1556,6 +1747,7 @@ public sealed partial class MainWindow : Window
         _taskbar?.Dispose();
         _tray?.Dispose();
         _smtc.Dispose();
+        PlaylistCovers.Changed -= OnPlaylistCoverChanged;
         App.ForgetShell(this);
         _current = null;
     }
@@ -1623,6 +1815,10 @@ public sealed partial class MainWindow : Window
 
                 break;
             }
+
+            case Win32.WM_APPCOMMAND:
+                if (_current?.HandleMediaAppCommand(lParam) == true) return 1;
+                break;
 
             case Win32.WM_QUERYENDSESSION:
                 FlushSession();

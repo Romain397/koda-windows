@@ -1,4 +1,5 @@
 using System;
+using Microsoft.UI.Dispatching;
 using Windows.Foundation;
 using Windows.Media;
 using Windows.Storage.Streams;
@@ -15,18 +16,17 @@ public sealed class SmtcController : IDisposable
 {
     private SystemMediaTransportControls? _smtc;
     private Action<SystemMediaTransportControlsButton>? _onButton;
+    private DispatcherQueue? _dispatch;
 
-    public void Bind(nint hwnd, Action<SystemMediaTransportControlsButton> onButton)
+    public void Bind(nint hwnd, DispatcherQueue dispatch, Action<SystemMediaTransportControlsButton> onButton)
     {
+        _dispatch = dispatch;
         _onButton = onButton;
         var smtc = SystemMediaTransportControlsInterop.GetForWindow(hwnd);
         _smtc = smtc;
         smtc.ButtonPressed += OnButtonPressed;
-        smtc.IsPlayEnabled = true;
-        smtc.IsPauseEnabled = true;
-        // Queue exists as of Phase 3: next/previous ride the real queue grammar.
-        smtc.IsNextEnabled = false;
-        smtc.IsPreviousEnabled = false;
+        smtc.IsEnabled = true;
+        SetTransport(false, false, false);
         smtc.DisplayUpdater.Type = MediaPlaybackType.Music;
         // No track: the card is silent (Stopped) until the first content arrives.
         smtc.PlaybackStatus = MediaPlaybackStatus.Stopped;
@@ -34,19 +34,21 @@ public sealed class SmtcController : IDisposable
 
     private void OnButtonPressed(SystemMediaTransportControls sender, SystemMediaTransportControlsButtonPressedEventArgs args)
     {
-        // Window-bound SMTC raises button events on the app's UI thread.
-        _onButton?.Invoke(args.Button);
+        var button = args.Button;
+        if (_dispatch is { HasThreadAccess: true }) _onButton?.Invoke(button);
+        else _dispatch?.TryEnqueue(() => _onButton?.Invoke(button));
     }
 
     /// <summary>Playback state changed - manual, from the PlaybackService.</summary>
-    public void UpdatePlaybackState(bool playing)
+    public void UpdatePlaybackState(bool playing, bool stopped = false)
     {
         if (_smtc is null)
         {
             return;
         }
 
-        _smtc.PlaybackStatus = playing ? MediaPlaybackStatus.Playing : MediaPlaybackStatus.Paused;
+        _smtc.PlaybackStatus = stopped ? MediaPlaybackStatus.Stopped
+            : playing ? MediaPlaybackStatus.Playing : MediaPlaybackStatus.Paused;
     }
 
     /// <summary>The card's track: title, artist and the artwork the flyout shows.</summary>
@@ -87,13 +89,16 @@ public sealed class SmtcController : IDisposable
     }
 
     /// <summary>Transport enablement follows the queue: honest buttons on the flyout.</summary>
-    public void SetTransport(bool canPrevious, bool canNext)
+    public void SetTransport(bool hasTrack, bool canPrevious, bool canNext)
     {
         if (_smtc is null)
         {
             return;
         }
 
+        _smtc.IsPlayEnabled = hasTrack;
+        _smtc.IsPauseEnabled = hasTrack;
+        _smtc.IsStopEnabled = hasTrack;
         _smtc.IsPreviousEnabled = canPrevious;
         _smtc.IsNextEnabled = canNext;
     }
@@ -131,8 +136,7 @@ public sealed class SmtcController : IDisposable
         }
 
         ClearTrack();
-        _smtc.IsPreviousEnabled = false;
-        _smtc.IsNextEnabled = false;
+        SetTransport(false, false, false);
     }
 
     public void Dispose()
@@ -142,5 +146,7 @@ public sealed class SmtcController : IDisposable
             _smtc.ButtonPressed -= OnButtonPressed;
             _smtc = null;
         }
+        _onButton = null;
+        _dispatch = null;
     }
 }

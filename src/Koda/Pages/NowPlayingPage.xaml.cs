@@ -42,6 +42,7 @@ public sealed partial class NowPlayingPage : Page
 
     private PlaybackService Playback => PlaybackService.Instance;
     private readonly ObservableCollection<QueueItem> _upcoming = [];
+    private PlaylistReference? _shownPlaylist;
     private string? _paletteFor;
     private bool _wide = true;
     private bool _scrubbing;
@@ -120,6 +121,8 @@ public sealed partial class NowPlayingPage : Page
         Playback.PositionTick += OnPositionTick;
         Playback.SleepChanged += OnSleepChanged;
         App.Library.Changed += OnLibraryChanged;
+        Profiles.Roster.Changed += OnProfileChanged;
+        PlaylistCovers.Changed += OnPlaylistCoverChanged;
         App.Settings.Changed += OnSettingsChanged;
         EnergySaver.Changed += OnEnergySaverChanged;
         Volume.Value = App.Volume;
@@ -145,6 +148,8 @@ public sealed partial class NowPlayingPage : Page
         Playback.PositionTick -= OnPositionTick;
         Playback.SleepChanged -= OnSleepChanged;
         App.Library.Changed -= OnLibraryChanged;
+        Profiles.Roster.Changed -= OnProfileChanged;
+        PlaylistCovers.Changed -= OnPlaylistCoverChanged;
         App.Settings.Changed -= OnSettingsChanged;
         EnergySaver.Changed -= OnEnergySaverChanged;
         _lyrics?.Pause();
@@ -154,7 +159,16 @@ public sealed partial class NowPlayingPage : Page
     private void OnTrackChanged() => DispatcherQueue.TryEnqueue(RenderTrack);
     private void OnQueueChanged() => DispatcherQueue.TryEnqueue(RenderQueue);
     private void OnPlayStateChanged() => DispatcherQueue.TryEnqueue(RenderPlayState);
-    private void OnLibraryChanged() => DispatcherQueue.TryEnqueue(UpdateLike);
+    private void OnLibraryChanged() => DispatcherQueue.TryEnqueue(() =>
+    {
+        UpdateLike();
+        RenderPlaylistOrigin();
+    });
+    private void OnProfileChanged() => DispatcherQueue.TryEnqueue(() => RenderPlaylistOrigin());
+    private void OnPlaylistCoverChanged(PlaylistReference changed) => DispatcherQueue.TryEnqueue(() =>
+    {
+        if (Playback.CurrentPlaylist?.SamePlaylist(changed) == true) RenderPlaylistOrigin(reloadCover: true);
+    });
     private void OnSettingsChanged(Settings settings) => DispatcherQueue.TryEnqueue(ApplySkipSettings);
     private void OnSleepChanged() => DispatcherQueue.TryEnqueue(UpdateSleepPill);
     private void OnEnergySaverChanged() => DispatcherQueue.TryEnqueue(RenderPlayState);
@@ -164,6 +178,7 @@ public sealed partial class NowPlayingPage : Page
     private void RenderTrack()
     {
         var song = Playback.CurrentSong;
+        RenderPlaylistOrigin();
         Idle.Visibility = song is null ? Visibility.Visible : Visibility.Collapsed;
         Layout.Visibility = song is null ? Visibility.Collapsed : Visibility.Visible;
         if (song is null)
@@ -183,6 +198,24 @@ public sealed partial class NowPlayingPage : Page
         OnPositionTick();
         _ = PaintAsync(song);
         _ = LoadLyricsAsync(song);
+    }
+
+    private void RenderPlaylistOrigin(bool reloadCover = false)
+    {
+        var source = Playback.CurrentPlaylist;
+        if (!reloadCover && source == _shownPlaylist) return;
+        _shownPlaylist = source;
+        PlaylistOriginButton.Visibility = source is null ? Visibility.Collapsed : Visibility.Visible;
+        PlaylistOriginName.Text = source?.Title ?? "";
+        PlaylistOriginArt.Source = source is null ? null : PlaylistCovers.ImageFor(source, 26);
+        ToolTipService.SetToolTip(PlaylistOriginButton, source is null ? null : $"Open playlist: {source.Title}");
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(PlaylistOriginButton,
+            source is null ? "" : $"Playing from {source.Title}. Open playlist");
+    }
+
+    private void OnPlaylistOriginClick(object sender, RoutedEventArgs e)
+    {
+        if (Playback.CurrentPlaylist is { } source) Navigator.OpenPlaylist(source);
     }
 
     // MARK: lyrics

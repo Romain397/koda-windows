@@ -327,9 +327,11 @@ public static class Pages
 
     public static PlaylistPage? Playlist(Json root, string id)
     {
-        var header = root.First("musicResponsiveHeaderRenderer").Exists
-            ? root.First("musicResponsiveHeaderRenderer")
-            : root.First("musicDetailHeaderRenderer");
+        var editable = root.First("musicEditablePlaylistDetailHeaderRenderer");
+        var header = editable.First("musicResponsiveHeaderRenderer");
+        if (!header.Exists) header = editable.First("musicDetailHeaderRenderer");
+        if (!header.Exists) header = root.First("musicResponsiveHeaderRenderer");
+        if (!header.Exists) header = root.First("musicDetailHeaderRenderer");
         var title = header["title"].Text();
         if (title.Length == 0) return null;
         var strapline = Rows.PlainText(header["straplineTextOne"].Runs());
@@ -338,25 +340,35 @@ public static class Pages
             strapline.TrimmedOrNull(),
             Rows.PlainText(header["secondSubtitle"].Runs()).TrimmedOrNull(),
             header.First("musicDescriptionShelfRenderer")["description"].Text().TrimmedOrNull(),
-            PlaylistSongs(root),
-            PlaylistContinuation(root));
+            PlaylistTracks(root),
+            PlaylistContinuation(root),
+            IsEditablePlaylistId(id) && editable.Exists
+                && (editable["playlistId"].NonEmpty is not { } editableId || PlaylistId(editableId) == id));
     }
 
-    public static Song[] PlaylistSongs(Json root)
+    internal static string PlaylistId(string id) => id.StartsWith("VL", StringComparison.Ordinal) ? id[2..] : id;
+
+    internal static bool IsEditablePlaylistId(string id) => id is not ("" or "WL" or "LL" or "LM" or "SE");
+
+    public static Song[] PlaylistSongs(Json root) => [.. PlaylistTracks(root).Select(track => track.Song)];
+
+    internal static PlaylistTrack[] PlaylistTracks(Json root)
     {
         var containers = root.Objects("musicPlaylistShelfRenderer")
+            .Concat(root.Objects("musicPlaylistShelfContinuation"))
             .Concat(root.Objects("appendContinuationItemsAction"));
-        var songs = new List<Song>();
+        var tracks = new List<PlaylistTrack>();
         foreach (var container in containers)
         {
             var entries = container["contents"].Array.Concat(container["continuationItems"].Array);
             foreach (var entry in entries)
             {
-                var song = Rows.SongFromListRow(entry["musicResponsiveListItemRenderer"]);
-                if (song is not null) songs.Add(song);
+                var row = entry["musicResponsiveListItemRenderer"];
+                if (Rows.SongFromListRow(row) is { } song)
+                    tracks.Add(new PlaylistTrack(song, row["playlistItemData"]["playlistSetVideoId"].NonEmpty));
             }
         }
-        return [.. songs];
+        return [.. tracks];
     }
 
     /// <summary>
@@ -366,6 +378,7 @@ public static class Pages
     public static string? PlaylistContinuation(Json root)
     {
         var scopes = root.Objects("musicPlaylistShelfRenderer")
+            .Concat(root.Objects("musicPlaylistShelfContinuation"))
             .Concat(root.Objects("appendContinuationItemsAction"));
         foreach (var scope in scopes)
         {

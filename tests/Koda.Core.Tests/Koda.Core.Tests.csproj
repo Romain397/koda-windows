@@ -24,6 +24,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Koda.Core\Koda.Core.csproj" />
+    <Compile Include="..\..\src\Koda\Playback\PlayQueue.cs" Link="PlayQueue.cs" />
   </ItemGroup>
 
 </Project>
