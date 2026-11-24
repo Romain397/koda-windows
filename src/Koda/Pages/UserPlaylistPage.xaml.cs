@@ -238,10 +238,7 @@ public sealed partial class UserPlaylistPage : Page
 
     private void OnPlayClick(object sender, RoutedEventArgs e)
     {
-        if (_songs.Length > 0)
-        {
-            _ = PlaybackService.Instance.PlayNowAsync(_songs[0], _songs, Source);
-        }
+        if (Source is { } source) _ = PlaybackService.Instance.PlayPlaylistAsync(_songs, source);
     }
 
     private void OnShuffleClick(object sender, RoutedEventArgs e) => _ = PlaybackService.Instance.ShuffleAsync(_songs, Source);

@@ -1,4 +1,5 @@
 using Koda.Core;
+using Koda.Core.Playback;
 
 namespace Koda.Core.Tests;
 
@@ -29,6 +30,47 @@ public class SettingsTests
 
         Assert.True(settings.CloseToTray);
         Assert.Equal(100, settings.Volume);
+    }
+
+    [Fact]
+    public void MusicVolumeMuteAndTheSelectedPanelSurviveRestart()
+    {
+        var path = Path.Combine(Fixtures.Scratch, $"player-settings-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, """{ "volume": 42 }""");
+        var settings = Settings.Load(path);
+        Assert.False(settings.MusicMuted);
+        Assert.Equal(NowPlayingPanel.None, settings.PlayerPanel);
+
+        settings.Update(s =>
+        {
+            s.MusicMuted = true;
+            s.PlayerPanel = NowPlayingPanel.Lyrics;
+        });
+
+        var restored = Settings.Load(path);
+        Assert.Equal(42, restored.Volume);
+        Assert.True(restored.MusicMuted);
+        Assert.Equal(NowPlayingPanel.Lyrics, restored.PlayerPanel);
+    }
+
+    [Fact]
+    public void LoudnessProfileSurvivesRestartAndOldSettingsKeepTheirToggle()
+    {
+        var path = Path.Combine(Fixtures.Scratch, $"loudness-settings-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, """{ "normalizesVolume": false, "volume": 40 }""");
+        var settings = Settings.Load(path);
+        Assert.False(settings.NormalizesVolume);
+        Assert.Equal(LoudnessLevel.Normal, settings.VolumeNormalizationLevel);
+
+        settings.Update(s =>
+        {
+            s.NormalizesVolume = true;
+            s.VolumeNormalizationLevel = LoudnessLevel.Quiet;
+        });
+        var restored = Settings.Load(path);
+        Assert.True(restored.NormalizesVolume);
+        Assert.Equal(LoudnessLevel.Quiet, restored.VolumeNormalizationLevel);
+        Assert.Equal(40, restored.Volume);
     }
 
     [Fact]

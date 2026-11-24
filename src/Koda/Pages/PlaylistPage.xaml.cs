@@ -22,7 +22,7 @@ public sealed partial class PlaylistPage : Page
 {
     private string _id = "";
     private EnginePlaylist? _playlist;
-    private readonly ObservableCollection<TrackRow> _rows = [];
+    private ObservableCollection<TrackRow> _rows = [];
     private readonly List<Song> _songs = [];
     private string? _continuation;
     private string? _playlistSession;
@@ -33,6 +33,7 @@ public sealed partial class PlaylistPage : Page
     private HashSet<string> _seenContinuations = new(StringComparer.Ordinal);
     private bool _editing;
     private int _loadVersion;
+    private int _playRequest;
     private ScrollViewer? _scroller;
 
     private PlaylistReference? Source => _playlist is { } page ? PlaylistReference.From(page.Playlist) : null;
@@ -44,7 +45,9 @@ public sealed partial class PlaylistPage : Page
     {
         InitializeComponent();
         Tracks.ItemsSource = _rows;
-        SongMenu.Attach(Tracks, () => _songs, rowActions: TrackActions, playlist: () => Source);
+        DownloadButton.Songs = _songs;
+        SongMenu.Attach(Tracks, () => _songs, rowActions: TrackActions, playlist: () => Source,
+            playNow: song => _ = PlayPlaylistAsync(song));
     }
 
     protected override void OnNavigatedTo(NavigationEventArgs args)
@@ -95,8 +98,7 @@ public sealed partial class PlaylistPage : Page
         }
         catch (MusicException error) when (error.Kind == MusicException.Reason.BadResponse && _id.StartsWith("OLAK5uy_"))
         {
-            var songs = await EngineHost.Music.PlaylistSongsAsync("VL" + _id,
-                limit: _fallback?.LoadAll == true ? null : 500, cancellation: cancellation);
+            var songs = await EngineHost.Music.PlaylistSongsAsync("VL" + _id, limit: null, cancellation: cancellation);
             var title = _fallback?.Title ?? "Songs";
             return new EnginePlaylist(new PlaylistSummary(_id, title, null, _fallback?.Artwork ?? songs.FirstOrDefault()?.Artwork),
                 _fallback?.Subtitle, $"{songs.Length} songs", null, [.. songs.Select(song => new PlaylistTrack(song))], null);
@@ -144,9 +146,11 @@ public sealed partial class PlaylistPage : Page
 
             _playlist = page;
             _playlistSession = session;
-            _rows.Clear();
             _songs.Clear();
-            Append(tracks);
+            _songs.AddRange(tracks.Select(track => track.Song));
+            _rows = new ObservableCollection<TrackRow>(tracks.Select((track, index) =>
+                new TrackRow(index + 1, track.Song, track.SetVideoId)));
+            Tracks.ItemsSource = _rows;
             _continuation = continuation;
             _seenContinuations = seen;
             ShowHeader(page);
@@ -170,7 +174,7 @@ public sealed partial class PlaylistPage : Page
             }
         }
 
-        if (loadAll) await AllSongsAsync();
+        if (loadAll) await LoadRemainingAsync();
     }
 
     private void CancelLoad()
@@ -190,7 +194,7 @@ public sealed partial class PlaylistPage : Page
         Description.Text = page.Description ?? "";
         Description.Visibility = page.Description is null ? Visibility.Collapsed : Visibility.Visible;
         DownloadButton.Title = page.Playlist.Title;
-        DownloadButton.Songs = _songs.ToArray();
+        DownloadButton.Refresh();
         // A long playlist arrives in pages; Download fetches the rest first.
         DownloadButton.AllSongs = AllSongsAsync;
         UpdateSave();
@@ -258,7 +262,7 @@ public sealed partial class PlaylistPage : Page
             _seenContinuations.Add(token);
             Append(more.Tracks);
             _continuation = more.Continuation;
-            DownloadButton.Songs = _songs.ToArray();
+            DownloadButton.Refresh();
             UpdateEmpty();
             return true;
         }
@@ -279,12 +283,14 @@ public sealed partial class PlaylistPage : Page
     private void OnMoreRetryClick(object sender, RoutedEventArgs e)
     {
         if (_continuation is { } token && _seenContinuations.Contains(token)) _ = LoadAsync(fresh: true);
-        else if (_fallback?.LoadAll == true) _ = AllSongsAsync();
+        else if (_fallback?.LoadAll == true) _ = LoadRemainingAsync();
         else _ = LoadMoreAsync();
     }
 
-    /// <summary>Every track, for Play and Shuffle: the pages not yet seen are fetched first.</summary>
-    private async Task<IReadOnlyList<Song>> AllSongsAsync()
+    private async Task<IReadOnlyList<Song>> AllSongsAsync() =>
+        await LoadRemainingAsync() ? _songs.ToArray() : [];
+
+    private async Task<bool> LoadRemainingAsync()
     {
         var version = _loadVersion;
         while (version == _loadVersion && _continuation is not null)
@@ -292,39 +298,48 @@ public sealed partial class PlaylistPage : Page
             if (!await LoadMoreAsync()) break;
         }
 
-        return version == _loadVersion ? _songs.ToArray() : [];
+        return version == _loadVersion && _continuation is null;
     }
 
-    private void OnPlayClick(object sender, RoutedEventArgs e)
-    {
-        if (_songs.Count > 0) _ = PlayPlaylistAsync(_songs[0]);
-    }
+    private void OnPlayClick(object sender, RoutedEventArgs e) => _ = PlayPlaylistAsync();
 
-    private async Task PlayPlaylistAsync(Song song)
+    private async Task PlayPlaylistAsync(Song? song = null, bool shuffle = false)
     {
-        var playback = PlaybackService.Instance;
+        if (!_active || _loadingPage || Source is not { } source) return;
+        var request = ++_playRequest;
+        var version = _loadVersion;
         var profile = Profiles.ActiveKey;
-        var source = Source;
-        var known = _songs.Count;
-        _ = playback.PlayNowAsync(song, _songs.ToArray(), source);
-        var anchor = playback.Queue.Items.FirstOrDefault()?.Id;
-        // The queue grows to the whole playlist once the rest arrives.
-        var all = await AllSongsAsync();
-        if (all.Count > known && Profiles.ActiveKey == profile && playback.Queue.Items.Count == known
-            && playback.Queue.Items[0].Id == anchor)
+        var waiting = _continuation is not null;
+        PlayLoading.IsActive = waiting;
+        PlayLoading.Visibility = waiting ? Visibility.Visible : Visibility.Collapsed;
+        IReadOnlyList<Song> songs;
+        try
         {
-            // Appended after the known tail, in order, without a note.
-            playback.AddToQueue([.. all.Skip(known)], announce: false, playlist: source);
+            songs = await AllSongsAsync();
         }
+        finally
+        {
+            if (request == _playRequest)
+            {
+                PlayLoading.IsActive = false;
+                PlayLoading.Visibility = Visibility.Collapsed;
+            }
+        }
+
+        if (request != _playRequest || version != _loadVersion || Profiles.ActiveKey != profile) return;
+        if (_continuation is not null)
+        {
+            App.Shell?.Note("Couldn't load every song in this playlist. Try playing it again.");
+            return;
+        }
+
+        var playback = PlaybackService.Instance;
+        if (shuffle) await playback.ShuffleAsync(songs, source);
+        else if (song is not null) await playback.PlayNowAsync(song, songs, source);
+        else await playback.PlayPlaylistAsync(songs, source);
     }
 
-    private async void OnShuffleClick(object sender, RoutedEventArgs e)
-    {
-        var profile = Profiles.ActiveKey;
-        var source = Source;
-        var songs = await AllSongsAsync();
-        if (_active && Profiles.ActiveKey == profile) await PlaybackService.Instance.ShuffleAsync(songs, source);
-    }
+    private void OnShuffleClick(object sender, RoutedEventArgs e) => _ = PlayPlaylistAsync(shuffle: true);
 
     private void OnTrackClick(object sender, ItemClickEventArgs e)
     {

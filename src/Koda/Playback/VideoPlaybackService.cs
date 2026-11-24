@@ -158,7 +158,12 @@ public sealed class VideoPlaybackService
             return;
         }
 
+        SaveProgress(force: true);
+        _player.Pause();
+        _player.Source = null;
+        _duration = 0;
         Current = video;
+        _tick?.Start();
         Watch = null;
         Error = null;
         _caption = "";
@@ -176,13 +181,13 @@ public sealed class VideoPlaybackService
         await OpenAsync(video, startAt ?? App.Library.ProgressOf(video.Id)?.ResumeAt ?? 0, Quality, record: true);
     }
 
-    private async Task OpenAsync(Video video, double startAt, int quality, bool record)
+    private async Task OpenAsync(Video video, double startAt, int quality, bool record, bool play = true)
     {
         var generation = ++_generation;
         IsLoading = true;
         Error = null;
         _pendingPosition = startAt;
-        _shouldPlay = true;
+        _shouldPlay = play;
         Changed?.Invoke();
         try
         {
@@ -334,17 +339,20 @@ public sealed class VideoPlaybackService
         if (_recovering || Current is not { } video) return;
         _recovering = true;
         _recoverAttempts++;
+        var generation = _generation;
         var position = Position;
         try
         {
             // googlevideo URLs expire; a refused stream is resolved again, then the same place
             // is put back.
             await EngineHost.Music.VideoStreamFailedAsync(video.Id);
+            if (generation != _generation) return;
             _stream = null;
-            await OpenAsync(video, position, Quality, record: false);
+            await OpenAsync(video, position, Quality, record: false, play: _shouldPlay);
         }
         catch (Exception)
         {
+            if (generation != _generation) return;
             Error = "This video stopped playing. Try again.";
             IsLoading = false;
             Changed?.Invoke();
@@ -635,7 +643,7 @@ public sealed class VideoPlaybackService
         tick.Interval = TimeSpan.FromMilliseconds(500);
         tick.IsRepeating = true;
         tick.Tick += (_, _) => OnTick();
-        tick.Start();
+        if (HasVideo) tick.Start();
         _tick = tick;
 
         var autoplay = _dispatch.CreateTimer();
@@ -708,6 +716,7 @@ public sealed class VideoPlaybackService
     public void Stop()
     {
         _generation++;
+        _tick?.Stop();
         SaveProgress(force: true);
         _player.Pause();
         _player.Source = null;

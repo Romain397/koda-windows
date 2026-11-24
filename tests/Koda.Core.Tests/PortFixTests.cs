@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net;
+using System.Net.Http.Headers;
 using Koda.Core.Playback;
 using Koda.Core.Storage;
 
@@ -63,8 +64,7 @@ public class PortFixTests : IDisposable
     {
         const long length = 4 * 1024 * 1024;
         var handler = new RangeHandler(length, blockFirst: true);
-        var store = new AudioStore(_dir);
-        using var loader = CachingLoader.Create(Stream(length), null, store, handler)!;
+        using var loader = new StreamingLoader(Stream(length), handler);
 
         // The player asks for the head, then seeks away and gives that read up (didCancel).
         using var gaveUp = new CancellationTokenSource();
@@ -89,13 +89,78 @@ public class PortFixTests : IDisposable
     public async Task DisposeFailsReadsStillWaiting()
     {
         var handler = new RangeHandler(1_000_000, blockFirst: true);
-        var store = new AudioStore(_dir);
-        var loader = CachingLoader.Create(Stream(1_000_000), null, store, handler)!;
+        var loader = new StreamingLoader(Stream(1_000_000), handler);
         var read = loader.ReadAsync(0, new byte[16]);
         await handler.FirstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         loader.Dispose();
         await Assert.ThrowsAsync<ObjectDisposedException>(() => read.WaitAsync(TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task StreamingReusesOneBoundedRangeAndOnlyFetchesMoreOnDemand()
+    {
+        const long length = 4 * 1024 * 1024;
+        var handler = new RangeHandler(length, blockFirst: false);
+        using var loader = new StreamingLoader(Stream(length) with { ContentLength = null }, handler);
+        Assert.Equal(length, await loader.GetLengthAsync().WaitAsync(TimeSpan.FromSeconds(5)));
+
+        var buffer = new byte[128];
+        Assert.Equal(128, await loader.ReadAsync(2048, buffer));
+        Assert.Equal(RangeHandler.Expected(2048, buffer.Length), buffer);
+        Assert.Equal((0L, StreamingLoader.BufferSize - 1L), Assert.Single(handler.Ranges));
+
+        var crossing = StreamingLoader.BufferSize - 64;
+        Assert.Equal(128, await loader.ReadAsync(crossing, buffer).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(RangeHandler.Expected(crossing, buffer.Length), buffer);
+        Assert.Equal((StreamingLoader.BufferSize, 2L * StreamingLoader.BufferSize - 1), handler.Ranges.Last());
+        Assert.Equal(2, handler.Ranges.Count);
+        Assert.False(Directory.Exists(_dir));
+
+        Assert.Equal(5, await loader.ReadAsync(length - 5, buffer));
+        Assert.Equal(RangeHandler.Expected(length - 5, 5), buffer[..5]);
+        Assert.Equal(0, await loader.ReadAsync(length, buffer));
+    }
+
+    [Fact]
+    public async Task AResponseWithTheWrongOffsetIsRejectedBeforeCopyingAnyAudio()
+    {
+        var handler = new RangeHandler(1_000_000, blockFirst: false) { WrongOffset = true };
+        using var loader = new StreamingLoader(Stream(1_000_000), handler);
+        var buffer = new byte[16];
+        await Assert.ThrowsAsync<IOException>(() => loader.ReadAsync(250, buffer).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.All(buffer, value => Assert.Equal(0, value));
+    }
+
+    [Fact]
+    public async Task StreamingRefusesToFollowARedirectOutsideTheAudioHost()
+    {
+        var handler = new RangeHandler(1_000_000, blockFirst: false)
+        {
+            Redirect = new Uri("https://googlevideo.com.example.invalid/audio"),
+        };
+        using var loader = new StreamingLoader(Stream(1_000_000), handler);
+        await Assert.ThrowsAsync<IOException>(() => loader.ReadAsync(0, new byte[1]).WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Single(handler.Ranges);
+    }
+
+    [Fact]
+    public async Task OversizedMp4MetadataIsRejectedBeforeItsPayloadIsRead()
+    {
+        var calls = 0;
+        Task<byte[]> Read(long offset, int count, CancellationToken cancellation)
+        {
+            calls++;
+            Assert.Equal(0, offset);
+            Assert.Equal(16, count);
+            var header = new byte[count];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header, 4 * 1024 * 1024);
+            "moov"u8.CopyTo(header.AsSpan(4));
+            return Task.FromResult(header);
+        }
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => Fmp4Audio.OpenAsync(Read, 8 * 1024 * 1024));
+        Assert.Equal(1, calls);
     }
 
     private static ResolvedStream Stream(long length) =>
@@ -105,6 +170,9 @@ public class PortFixTests : IDisposable
     private sealed class RangeHandler(long length, bool blockFirst) : HttpMessageHandler
     {
         private int _calls;
+        public bool WrongOffset { get; init; }
+        public Uri? Redirect { get; init; }
+        public System.Collections.Concurrent.ConcurrentQueue<(long From, long To)> Ranges { get; } = new();
         public TaskCompletionSource FirstStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource FirstCancelled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -134,10 +202,20 @@ public class PortFixTests : IDisposable
             var range = request.Headers.Range!.Ranges.Single();
             var from = range.From!.Value;
             var to = Math.Min(range.To ?? length - 1, length - 1);
-            return new HttpResponseMessage(HttpStatusCode.PartialContent)
+            Ranges.Enqueue((from, to));
+            if (Redirect is not null)
+            {
+                var redirect = new HttpResponseMessage(HttpStatusCode.Found);
+                redirect.Headers.Location = Redirect;
+                return redirect;
+            }
+
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
             {
                 Content = new ByteArrayContent(Expected(from, (int)(to - from + 1))),
             };
+            response.Content.Headers.ContentRange = new ContentRangeHeaderValue(from + (WrongOffset ? 1 : 0), to, length);
+            return response;
         }
     }
 }

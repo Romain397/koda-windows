@@ -18,12 +18,11 @@ public partial class App : Application
     /// <summary>Where the app keeps its state: the engine's path, one source of truth.</summary>
     public static string DataDirectory { get; } = Koda.Core.DataPaths.Root;
 
-    /// <summary>The audio byte store under the data root's audio folder - the CachingLoader
-    /// transport keeps every byte that streams through, so a song played before starts from the file.</summary>
+    /// <summary>Explicit downloads and any playback cache left by earlier versions.</summary>
     public static Koda.Core.Storage.AudioStore AudioStore { get; } =
         new(Path.Combine(DataDirectory, "audio"))
         {
-            // How much is kept for songs played from the network is the listener's choice.
+            // Keep the configured limit for the cache left by earlier versions.
             CacheLimit = (long)Koda.Core.Settings.Current.CacheLimit,
         };
 

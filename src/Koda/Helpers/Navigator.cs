@@ -72,7 +72,7 @@ public static class SongMenu
     public static void Attach(UIElement list, Func<IReadOnlyList<Song>> queue,
         Func<Song, IEnumerable<MenuFlyoutItemBase>>? extra = null,
         Func<TrackRow, IEnumerable<MenuFlyoutItemBase>>? rowActions = null,
-        Func<PlaylistReference?>? playlist = null) =>
+        Func<PlaylistReference?>? playlist = null, Action<Song>? playNow = null) =>
         list.ContextRequested += (sender, args) =>
         {
             if (args.OriginalSource is not FrameworkElement { DataContext: var context } || SongOf(context) is not { } song)
@@ -81,7 +81,7 @@ public static class SongMenu
             }
 
             var actions = context is TrackRow row && rowActions is not null ? rowActions(row) : extra?.Invoke(song);
-            var menu = Build(song, queue(), actions, playlist?.Invoke());
+            var menu = Build(song, queue(), actions, playlist?.Invoke(), playNow);
             var host = (FrameworkElement)sender;
             if (args.TryGetPosition(host, out var position))
             {
@@ -105,10 +105,14 @@ public static class SongMenu
     };
 
     public static MenuFlyout Build(Song song, IReadOnlyList<Song> queue, IEnumerable<MenuFlyoutItemBase>? extra = null,
-        PlaylistReference? playlist = null)
+        PlaylistReference? playlist = null, Action<Song>? playNow = null)
     {
         var menu = new MenuFlyout();
-        menu.Items.Add(Item("Play now", "\uE768", () => _ = PlaybackService.Instance.PlayNowAsync(song, queue.Count > 0 ? queue : [song], playlist)));
+        menu.Items.Add(Item("Play now", "\uE768", () =>
+        {
+            if (playNow is not null) playNow(song);
+            else _ = PlaybackService.Instance.PlayNowAsync(song, queue.Count > 0 ? queue : [song], playlist);
+        }));
         menu.Items.Add(Item("Add to queue", "\uE71C", () => PlaybackService.Instance.AddToQueue([song], playlist: playlist)));
         menu.Items.Add(Item("Play next", "\uE8A5", () => _ = PlaybackService.Instance.PlayNextAsync(song, playlist)));
         menu.Items.Add(Item("Start radio", "\uE8FE", () => _ = PlaybackService.Instance.StartRadioAsync(song)));

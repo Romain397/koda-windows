@@ -252,7 +252,11 @@
                             AutomationProperties.Name="Audio output">
                             <FontIcon Glyph="&#xE7F5;" FontSize="14" Foreground="#B3FFFFFF" />
                         </Button>
-                        <FontIcon Grid.Column="1" Glyph="&#xE992;" FontSize="14" Foreground="#B3FFFFFF" VerticalAlignment="Center" />
+                        <Button x:Name="VolumeMuteButton" Grid.Column="1" Width="36" Height="36" Padding="0"
+                                Background="Transparent" BorderThickness="0" Click="OnMuteClick"
+                                ToolTipService.ToolTip="Mute" AutomationProperties.Name="Mute">
+                            <FontIcon x:Name="VolumeMuteIcon" Glyph="&#xE767;" FontSize="14" Foreground="#B3FFFFFF" />
+                        </Button>
                         <Slider x:Name="Volume" Grid.Column="2" Minimum="0" Maximum="100" ValueChanged="OnVolumeChanged" AutomationProperties.Name="Volume" />
                         <FontIcon Grid.Column="3" Glyph="&#xE995;" FontSize="14" Foreground="#B3FFFFFF" VerticalAlignment="Center" />
                     </Grid>

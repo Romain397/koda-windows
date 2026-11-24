@@ -131,6 +131,7 @@ public sealed class Library
     // MARK: Reading
 
     public Song[] Liked { get { lock (_lock) return [.. _s.Liked]; } }
+    public int LikedCount { get { lock (_lock) return _s.Liked.Count; } }
     public AlbumSummary[] Albums { get { lock (_lock) return [.. _s.Albums]; } }
     public PlaylistSummary[] Playlists { get { lock (_lock) return [.. _s.Playlists]; } }
     public ArtistSummary[] Artists { get { lock (_lock) return [.. _s.Artists]; } }

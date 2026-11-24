@@ -158,19 +158,20 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center" Spacing="2">
-                            <TextBlock Text="Normalize volume" Style="{ThemeResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="Volume normalization" Style="{ThemeResource BodyStrongTextBlockStyle}" />
                             <TextBlock
-                                Text="Play loud masters at a similar level to everything else."
+                                Text="Lower louder tracks toward the selected loudness target."
                                 Style="{ThemeResource CaptionTextBlockStyle}"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 TextWrapping="Wrap" />
                         </StackPanel>
-                        <ToggleSwitch
-                            x:Name="NormalizeSwitch"
+                        <ComboBox
+                            x:Name="NormalizeLevelBox"
                             Grid.Column="1"
-                            Style="{StaticResource SettingsToggle}"
-                            AutomationProperties.Name="Normalize volume"
-                            Toggled="OnNormalizeToggled" />
+                            MinWidth="140"
+                            VerticalAlignment="Center"
+                            AutomationProperties.Name="Volume normalization"
+                            SelectionChanged="OnNormalizeLevelChanged" />
                     </Grid>
                     <Border Style="{StaticResource SettingsDivider}" />
                     <Grid Style="{StaticResource SettingsRow}">
@@ -975,30 +976,19 @@
                 </Grid>
             </Border>
 
-            <!-- Listening cache -->
-            <TextBlock Text="Listening cache" Style="{ThemeResource BodyStrongTextBlockStyle}" Margin="0,20,0,8" Tag="section" />
+            <!-- Streaming -->
+            <TextBlock Text="Streaming" Style="{ThemeResource BodyStrongTextBlockStyle}" Margin="0,20,0,8" Tag="section" />
             <Border Style="{StaticResource SettingsCard}">
                 <StackPanel>
                     <Grid Style="{StaticResource SettingsRow}">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center" Spacing="2">
-                            <TextBlock Text="Keep songs you play" Style="{ThemeResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="Audio buffer" Style="{ThemeResource BodyStrongTextBlockStyle}" />
                             <TextBlock
-                                Text="The listening cache's ceiling; downloads don't count."
+                                Text="Streaming audio stays in memory. Download songs to play them offline."
                                 Style="{ThemeResource CaptionTextBlockStyle}"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 TextWrapping="Wrap" />
                         </StackPanel>
-                        <ComboBox
-                            x:Name="CacheLimitBox"
-                            Grid.Column="1"
-                            MinWidth="140"
-                            VerticalAlignment="Center"
-                            AutomationProperties.Name="Keep songs you play"
-                            SelectionChanged="OnCacheLimitChanged" />
                     </Grid>
                     <Border Style="{StaticResource SettingsDivider}" />
                     <Grid Style="{StaticResource SettingsRow}">
@@ -1007,14 +997,15 @@
                             <ColumnDefinition Width="Auto" />
                         </Grid.ColumnDefinitions>
                         <StackPanel VerticalAlignment="Center" Spacing="2">
-                            <TextBlock Text="Kept on disk" Style="{ThemeResource BodyStrongTextBlockStyle}" />
+                            <TextBlock Text="Cache from earlier versions" Style="{ThemeResource BodyStrongTextBlockStyle}" />
                             <TextBlock
                                 x:Name="CacheSizeText"
                                 Style="{ThemeResource CaptionTextBlockStyle}"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 TextWrapping="Wrap" />
                         </StackPanel>
-                        <Button Grid.Column="1" VerticalAlignment="Center" Content="Clear" Click="OnClearCacheClick" />
+                        <Button x:Name="ClearCacheButton" Grid.Column="1" VerticalAlignment="Center" Content="Clear"
+                                Click="OnClearCacheClick" AutomationProperties.Name="Clear cache from earlier versions" />
                     </Grid>
                 </StackPanel>
             </Border>
@@ -1079,7 +1070,7 @@
                         <StackPanel VerticalAlignment="Center" Spacing="2">
                             <TextBlock Text="Data folder" Style="{ThemeResource BodyStrongTextBlockStyle}" />
                             <TextBlock
-                                Text="Where Koda keeps its library, settings, lyrics and listening cache."
+                                Text="Where Koda keeps its library, settings and offline downloads."
                                 Style="{ThemeResource CaptionTextBlockStyle}"
                                 Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                                 TextWrapping="Wrap" />

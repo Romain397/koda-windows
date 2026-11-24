@@ -131,7 +131,7 @@ public sealed partial class LibraryPage : Page
                 Navigator.Open(card.Item);
                 break;
             case UserPlaylistRow row when row.Playlist.Songs.Length > 0:
-                _ = PlaybackService.Instance.PlayNowAsync(row.Playlist.Songs[0], row.Playlist.Songs, PlaylistReference.From(row.Playlist));
+                _ = PlaybackService.Instance.PlayPlaylistAsync(row.Playlist.Songs, PlaylistReference.From(row.Playlist));
                 break;
         }
     }

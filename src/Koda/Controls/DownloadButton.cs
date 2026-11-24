@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Koda.Core;
 using Koda.Core.Storage;
@@ -20,6 +22,8 @@ public sealed class DownloadButton : Button
     private readonly TextBlock _label = new() { Text = "Download" };
     private IReadOnlyList<Song> _songs = [];
     private bool _attached;
+    private bool _busy;
+    private int _renderQueued;
 
     public DownloadButton()
     {
@@ -67,10 +71,21 @@ public sealed class DownloadButton : Button
     /// <summary>What the collection is called, for the confirmation and the note.</summary>
     public string Title { get; set; } = "";
 
-    private void OnDownloadsChanged() => DispatcherQueue?.TryEnqueue(Render);
+    private void OnDownloadsChanged() => Refresh();
+
+    public void Refresh()
+    {
+        if (Interlocked.Exchange(ref _renderQueued, 1) != 0) return;
+        if (DispatcherQueue?.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low, () =>
+        {
+            Interlocked.Exchange(ref _renderQueued, 0);
+            if (_attached) Render();
+        }) != true) Interlocked.Exchange(ref _renderQueued, 0);
+    }
 
     private void Render()
     {
+        if (_busy) return;
         var state = App.Downloads.StateOf(_songs);
         IsEnabled = _songs.Count > 0;
         string text;
@@ -99,38 +114,48 @@ public sealed class DownloadButton : Button
 
     private async void OnClick(object sender, RoutedEventArgs e)
     {
-        if (App.Downloads.StateOf(_songs).Phase != Downloads.Phase.None)
+        if (_busy) return;
+        var songs = _songs.ToArray();
+        var remove = App.Downloads.StateOf(songs).Phase != Downloads.Phase.None;
+        _busy = true;
+        IsEnabled = false;
+        try
         {
-            var name = string.IsNullOrEmpty(Title) ? "these songs" : Title;
-            if (await Helpers.Dialogs.ConfirmAsync($"Remove the download of {name}?",
-                    "They'll play from YouTube again, which needs a connection.", "Remove Download"))
+            if (remove)
             {
-                App.Downloads.Remove(_songs);
+                var name = string.IsNullOrEmpty(Title) ? "these songs" : Title;
+                if (await Helpers.Dialogs.ConfirmAsync($"Remove the download of {name}?",
+                        "They'll play from YouTube again, which needs a connection.", "Remove Download"))
+                {
+                    App.Downloads.Remove(songs);
+                }
+
+                return;
             }
 
-            return;
-        }
+            IReadOnlyList<Song> toDownload = songs;
+            if (AllSongs is { } all)
+            {
+                _label.Text = "Getting songs…";
+                toDownload = await all();
+            }
 
-        IReadOnlyList<Song> songs = _songs;
-        if (AllSongs is { } all)
+            if (toDownload.Count > 0)
+            {
+                App.Downloads.Download(toDownload);
+                App.Shell?.Note(toDownload.Count == 1
+                    ? $"Downloading “{toDownload[0].Title}”."
+                    : $"Downloading {toDownload.Count} songs.");
+            }
+        }
+        catch (Exception error)
         {
-            IsEnabled = false;
-            _label.Text = "Getting songs…";
-            try
-            {
-                songs = await all();
-                _songs = songs;
-            }
-            catch (Exception)
-            {
-                // The rest of the playlist didn't come; what is shown is downloaded.
-            }
+            if (_attached) App.Shell?.Note($"Couldn't download this collection. {Helpers.Errors.Describe(error)}");
         }
-
-        App.Downloads.Download(songs);
-        App.Shell?.Note(songs.Count == 1
-            ? $"Downloading “{songs[0].Title}”."
-            : $"Downloading {songs.Count} songs.");
-        Render();
+        finally
+        {
+            _busy = false;
+            if (_attached) Render();
+        }
     }
 }

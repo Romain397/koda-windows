@@ -32,29 +32,37 @@ public sealed class PlayQueue
     private List<QueueItem> _items = [];
     /// <summary>The order before shuffle, by occurrence. Empty while not shuffled.</summary>
     private List<Guid> _unshuffled = [];
+    private Saved? _savedItems;
 
     public IReadOnlyList<QueueItem> Items => _items;
+    public int ItemsVersion { get; private set; }
     public int? CurrentIndex { get; private set; }
     public bool IsShuffled { get; private set; }
+    public bool IsPlaylist { get; private set; }
     public RepeatMode Repeat { get; set; } = RepeatMode.Off;
 
     public QueueItem? Current => CurrentIndex is { } i ? _items[i] : null;
     public bool IsEmpty => _items.Count == 0;
 
+    public int UpcomingStart => (CurrentIndex ?? -1) + 1;
+    public int UpcomingCount => _items.Count - UpcomingStart;
+
     /// <summary>What plays after the current song, in order.</summary>
-    public IReadOnlyList<QueueItem> Upcoming => CurrentIndex is { } i ? _items.Skip(i + 1).ToArray() : _items.ToArray();
+    public IReadOnlyList<QueueItem> Upcoming => _items.Skip(UpcomingStart).ToArray();
 
     // MARK: Replacing
 
-    /// <summary>Play <paramref name="songs"/> from <paramref name="start"/>; shuffled, the start song plays
-    /// first and the rest follow in random order.</summary>
-    public void Replace(IReadOnlyList<Song> songs, int start = 0, bool shuffled = false, PlaylistSource? source = null)
+    /// <summary>Start with the selected song, or pick one at random when shuffling without a selection.</summary>
+    public void Replace(IReadOnlyList<Song> songs, int? start = null, bool shuffled = false, PlaylistSource? source = null)
     {
         _items = [.. songs.Select(song => QueueItem.Of(song, source))];
         _unshuffled = [];
         IsShuffled = false;
-        CurrentIndex = _items.Count == 0 ? null : Math.Clamp(start, 0, _items.Count - 1);
+        IsPlaylist = source is not null;
+        CurrentIndex = _items.Count == 0 ? null
+            : Math.Clamp(start ?? (shuffled ? Random.Shared.Next(_items.Count) : 0), 0, _items.Count - 1);
         if (shuffled) SetShuffle(true);
+        else ItemsChanged();
     }
 
     public void Clear()
@@ -62,7 +70,9 @@ public sealed class PlayQueue
         _items = [];
         _unshuffled = [];
         IsShuffled = false;
+        IsPlaylist = false;
         CurrentIndex = null;
+        ItemsChanged();
     }
 
     // MARK: Adding and removing
@@ -83,15 +93,18 @@ public sealed class PlayQueue
         {
             _unshuffled.InsertRange(anchor + 1, added.Select(a => a.Id));
         }
+        ItemsChanged();
     }
 
     /// <summary>Add to the end of the queue.</summary>
     public void Append(IReadOnlyList<Song> songs, PlaylistSource? source = null)
     {
+        if (songs.Count == 0) return;
         var added = songs.Select(song => QueueItem.Of(song, source)).ToList();
         _items.AddRange(added);
         if (IsShuffled) _unshuffled.AddRange(added.Select(a => a.Id));
         if (CurrentIndex is null && _items.Count > 0) CurrentIndex = 0;
+        ItemsChanged();
     }
 
     /// <summary>Remove an occurrence. The current song cannot be removed this way; skip it instead.</summary>
@@ -102,45 +115,70 @@ public sealed class PlayQueue
         _items.RemoveAt(index);
         _unshuffled.Remove(id);
         if (CurrentIndex is { } current && index < current) CurrentIndex = current - 1;
+        ItemsChanged();
         return true;
     }
 
-    /// <summary>Drop everything after the current song.</summary>
-    public void ClearUpcoming()
+    public sealed record ClearedUpcoming(Guid Current, int Version, QueueItem[] Items, Guid[]? OriginalOrder);
+
+    /// <summary>Drop everything after the current song and keep what is needed to undo it.</summary>
+    public ClearedUpcoming? ClearUpcoming()
     {
+        if (UpcomingCount == 0) return null;
         if (CurrentIndex is not { } current)
         {
             Clear();
-            return;
+            return null;
         }
 
-        var dropped = _items.Skip(current + 1).Select(i => i.Id).ToHashSet();
+        var cleared = _items.Skip(current + 1).ToArray();
+        var originalOrder = IsShuffled ? _unshuffled.ToArray() : null;
+        var dropped = cleared.Select(item => item.Id).ToHashSet();
         _items.RemoveRange(current + 1, _items.Count - current - 1);
         _unshuffled.RemoveAll(dropped.Contains);
+        ItemsChanged();
+        return new ClearedUpcoming(_items[current].Id, ItemsVersion, cleared, originalOrder);
+    }
+
+    public bool CanRestoreUpcoming(ClearedUpcoming cleared) =>
+        Current?.Id == cleared.Current && ItemsVersion == cleared.Version;
+
+    /// <summary>Restore exact queue occurrences, including their playlist source.</summary>
+    public bool RestoreUpcoming(ClearedUpcoming cleared)
+    {
+        if (!CanRestoreUpcoming(cleared)) return false;
+        _items.AddRange(cleared.Items);
+        if (cleared.OriginalOrder is { } order) _unshuffled = [.. order];
+        ItemsChanged();
+        return true;
     }
 
     /// <summary>Move one upcoming song; offsets count from the first upcoming song, as a list of them does.</summary>
     public void MoveUpcoming(int from, int to)
     {
-        var start = (CurrentIndex ?? -1) + 1;
+        var start = UpcomingStart;
         var a = start + from;
         var b = start + to;
         if (from == to || a < start || a >= _items.Count || b < start || b >= _items.Count) return;
         var item = _items[a];
         _items.RemoveAt(a);
         _items.Insert(b, item);
+        ItemsChanged();
     }
 
-    /// <summary>Forget all but the last <paramref name="keeping"/> songs already played, so a long
-    /// session's queue stays small; going back still reaches the recent ones.</summary>
+    /// <summary>Keep the playlist available for another round and limit unrelated playback history.</summary>
     public void TrimHistory(int keeping)
     {
         if (CurrentIndex is not { } current || current <= keeping) return;
         var drop = current - keeping;
-        var dropped = _items.Take(drop).Select(i => i.Id).ToHashSet();
-        _items.RemoveRange(0, drop);
-        CurrentIndex = current - drop;
+        var dropped = _items.Take(drop)
+            .Where(item => !IsPlaylist || item.Source is null)
+            .Select(item => item.Id).ToHashSet();
+        if (dropped.Count == 0) return;
+        _items.RemoveAll(item => dropped.Contains(item.Id));
+        CurrentIndex = current - dropped.Count;
         if (IsShuffled) _unshuffled.RemoveAll(dropped.Contains);
+        ItemsChanged();
     }
 
     // MARK: Moving through the queue
@@ -221,14 +259,35 @@ public sealed class PlayQueue
         }
 
         IsShuffled = on;
+        ItemsChanged();
     }
 
     // MARK: Saving (persistQueue on the Mac)
 
-    public sealed record Saved(Song[] Songs, int? Current, bool Shuffled, RepeatMode Repeat, PlaylistSource?[]? Sources = null);
+    public sealed record Saved(Song[] Songs, int? Current, bool Shuffled, RepeatMode Repeat,
+        PlaylistSource?[]? Sources = null, int[]? OriginalOrder = null, bool? IsPlaylist = null);
 
-    public Saved Save() => new([.. _items.Select(i => i.Song)], CurrentIndex, IsShuffled, Repeat,
-        _items.Any(item => item.Source is not null) ? [.. _items.Select(item => item.Source)] : null);
+    public Saved Save() => (_savedItems ??= SnapshotItems()) with { Current = CurrentIndex, Repeat = Repeat };
+
+    private void ItemsChanged()
+    {
+        ItemsVersion++;
+        _savedItems = null;
+    }
+
+    private Saved SnapshotItems()
+    {
+        int[]? originalOrder = null;
+        if (IsShuffled)
+        {
+            var indices = _items.Select((item, index) => (item.Id, index)).ToDictionary(pair => pair.Id, pair => pair.index);
+            originalOrder = [.. _unshuffled.Select(id => indices[id])];
+        }
+
+        return new Saved([.. _items.Select(i => i.Song)], CurrentIndex, IsShuffled, Repeat,
+            _items.Any(item => item.Source is not null) ? [.. _items.Select(item => item.Source)] : null,
+            originalOrder, IsPlaylist);
+    }
 
     public static PlayQueue Restore(Saved saved)
     {
@@ -236,8 +295,17 @@ public sealed class PlayQueue
         var sources = saved.Sources?.Length == saved.Songs.Length ? saved.Sources : null;
         queue._items = [.. saved.Songs.Select((song, index) => QueueItem.Of(song, sources?[index]))];
         queue.CurrentIndex = queue._items.Count == 0 ? null : Math.Clamp(saved.Current ?? 0, 0, queue._items.Count - 1);
-        // The pre-shuffle order is not kept across launches; the shuffled order simply stands.
-        queue.IsShuffled = false;
+        queue.IsPlaylist = saved.IsPlaylist ?? (queue._items.FirstOrDefault()?.Source is not null);
+        queue.IsShuffled = saved.Shuffled;
+        if (saved.Shuffled)
+        {
+            var order = saved.OriginalOrder;
+            // Older saves keep only the playback order, which can serve as their original order.
+            queue._unshuffled = order is not null && order.Length == queue._items.Count
+                && order.All(index => index >= 0 && index < queue._items.Count) && order.Distinct().Count() == order.Length
+                ? [.. order.Select(index => queue._items[index].Id)]
+                : [.. queue._items.Select(item => item.Id)];
+        }
         return queue;
     }
 }

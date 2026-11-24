@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Koda.Core.Playback;
 
 namespace Koda.Core;
 
@@ -37,6 +38,13 @@ public enum SongSort
     MostPlayed,
 }
 
+public enum NowPlayingPanel
+{
+    None,
+    Queue,
+    Lyrics,
+}
+
 /// <summary>
 /// What the listener has chosen, each saved the moment it changes.
 ///
@@ -63,6 +71,8 @@ public sealed class Settings
             new JsonStringEnumConverter<LyricsSource>(),
             new JsonStringEnumConverter<LibrarySort>(),
             new JsonStringEnumConverter<SongSort>(),
+            new JsonStringEnumConverter<NowPlayingPanel>(),
+            new JsonStringEnumConverter<LoudnessLevel>(),
         },
     };
 
@@ -85,6 +95,9 @@ public sealed class Settings
 
     /// <summary>The cover's colours drift behind Now Playing; off, they hold still.</summary>
     public bool AnimatesPlayerBackground { get; set; } = true;
+
+    /// <summary>The last selected side panel in the music player.</summary>
+    public NowPlayingPanel PlayerPanel { get; set; }
 
     /// <summary>Every lyrics service, best first; the order decides which answer wins.</summary>
     public List<LyricsSource> LyricsSourceOrder { get; set; } =
@@ -188,9 +201,13 @@ public sealed class Settings
     /// <summary>Koda's own volume, under the system's.</summary>
     public double Volume { get; set; } = 100;
 
-    /// <summary>Loud masters are brought down to YouTube's -14 LUFS target, so songs play at
-    /// a similar volume. Quiet ones are left alone rather than boosted.</summary>
+    /// <summary>Whether the music player is muted, independent of the volume level.</summary>
+    public bool MusicMuted { get; set; }
+
+    /// <summary>Apply a loudness target during music playback.</summary>
     public bool NormalizesVolume { get; set; } = true;
+
+    public LoudnessLevel VolumeNormalizationLevel { get; set; } = LoudnessLevel.Normal;
 
     /// <summary>Songs overlap as one ends and the next begins, the old fading out as the new
     /// fades in. Skips get a short fade too, so changing songs never cuts off mid-note.</summary>

@@ -76,10 +76,14 @@ internal sealed class LyricsPanel : IDisposable
     private readonly DispatcherQueueTimer _frame;
 
     private readonly List<Row> _rows = [];
+    private readonly List<Row> _settling = [];
     private readonly List<LyricLine> _lyricLines = [];
     private StackPanel? _leadingDots;
     private List<Ellipse> _leadingDotItems = [];
     private Row? _current;
+    private int _currentIndex = -1;
+    private Row? _visibleGap;
+    private bool _motion = true;
     private double _offset;
     private bool _userScrolled;
     private bool _loaded;
@@ -118,6 +122,7 @@ internal sealed class LyricsPanel : IDisposable
         public double Opacity { get; set; } = 0.36;
         /// <summary>How large the row is: the one being sung is full size.</summary>
         public double Scale { get; set; } = 0.99;
+        public bool Settling { get; set; }
     }
 
     public LyricsPanel(ScrollViewer scroll, StackPanel lines, DispatcherQueue queue)
@@ -202,13 +207,18 @@ internal sealed class LyricsPanel : IDisposable
     /// <summary>Fills the panel with the lyrics of a song.</summary>
     public void Load(Lyrics? lyrics)
     {
-        _tween.Stop();
+        Pause();
         _lines.Children.Clear();
         _rows.Clear();
+        _settling.Clear();
         _lyricLines.Clear();
         _leadingDots = null;
         _leadingDotItems = [];
         _current = null;
+        _currentIndex = -1;
+        _visibleGap = null;
+        _needsGlide = false;
+        _userScrolled = false;
         _loaded = lyrics is { IsSynced: true };
 
         if (lyrics is null)
@@ -247,7 +257,7 @@ internal sealed class LyricsPanel : IDisposable
             var row = new Row
             {
                 Line = line,
-                Words = new StackPanel { Spacing = 4 },
+                Words = new StackPanel { Spacing = 4, Opacity = 0.36 },
                 Background = new StackPanel { Spacing = 2, Opacity = 0.7 },
             };
 
@@ -460,11 +470,9 @@ internal sealed class LyricsPanel : IDisposable
         }
     }
 
-    /// <summary>Puts the panel on screen with a short fade, and starts it following the song.</summary>
+    /// <summary>Puts the panel on screen with a short fade.</summary>
     public void PlayEntrance()
     {
-        _frame.Start();
-
         // The panel has just come into view: the line being sung is placed now that the
         // panel knows its height (before that, there was nothing to measure against).
         if (_current is not null)
@@ -491,8 +499,26 @@ internal sealed class LyricsPanel : IDisposable
         storyboard.Begin();
     }
 
-    /// <summary>The panel is closed: it stops reading the song.</summary>
-    public void Pause() => _frame.Stop();
+    public void SetPlayback(bool playing, bool motion)
+    {
+        _motion = motion;
+        var interval = TimeSpan.FromMilliseconds(motion ? 16 : 100);
+        if (_frame.Interval != interval) _frame.Interval = interval;
+        if (playing && _loaded && _rows.Count > 0)
+        {
+            if (!_frame.IsRunning) _frame.Start();
+        }
+        else
+        {
+            Pause();
+        }
+    }
+
+    public void Pause()
+    {
+        _frame.Stop();
+        _tween.Stop();
+    }
 
     /// <summary>Follows the song: lights the line being sung and glides to it.</summary>
     public void Follow()
@@ -503,32 +529,27 @@ internal sealed class LyricsPanel : IDisposable
         }
 
         var index = Lyrics.IndexOf(_position, _lyricLines) ?? -1;
-        if (index < 0)
-        {
-            // Before the first line (the intro): still paint, so its dots fill.
-            Paint();
-            return;
-        }
-
         if (index >= _rows.Count)
         {
             return;
         }
 
-        var row = _rows[index];
-        if (!ReferenceEquals(row, _current))
+        if (index != _currentIndex)
         {
-            _current = row;
-            foreach (var other in _rows)
+            if (_currentIndex >= 0)
             {
-                var distance = Math.Abs(_rows.IndexOf(other) - index);
-                other.Opacity = other == row ? 1 : distance <= 1 ? 0.5 : 0.36;
-                other.Scale = other == row ? 1 : 0.99;
+                for (var i = Math.Max(0, _currentIndex - 1); i <= Math.Min(_rows.Count - 1, _currentIndex + 1); i++)
+                    SetAppearance(_rows[i], 0.36, 0.99);
             }
 
-            if (!_userScrolled)
+            _currentIndex = index;
+            _current = index >= 0 ? _rows[index] : null;
+            if (_current is { } row)
             {
-                GlideTo(row);
+                SetAppearance(row, 1, 1);
+                if (index > 0) SetAppearance(_rows[index - 1], 0.5, 0.99);
+                if (index + 1 < _rows.Count) SetAppearance(_rows[index + 1], 0.5, 0.99);
+                if (!_userScrolled) GlideTo(row);
             }
         }
 
@@ -550,21 +571,31 @@ internal sealed class LyricsPanel : IDisposable
         var time = _position;
         PaintInterlude(time);
 
-        foreach (var row in _rows)
+        for (var index = _settling.Count - 1; index >= 0; index--)
         {
+            var row = _settling[index];
             // The rows step back into place with a spring of their own.
-            row.Words.Opacity = Approach(row.Words.Opacity, row.Opacity);
+            row.Words.Opacity = _motion ? Approach(row.Words.Opacity, row.Opacity) : row.Opacity;
+            var settled = row.Words.Opacity == row.Opacity;
             if (row.RowTransform is { } transform)
             {
                 // A line-timed row has no words to scale one by one, so its whole line does it.
-                transform.ScaleX = Approach(transform.ScaleX, row.Scale);
+                transform.ScaleX = _motion ? Approach(transform.ScaleX, row.Scale) : row.Scale;
                 transform.ScaleY = transform.ScaleX;
+                settled &= transform.ScaleX == row.Scale;
             }
 
             foreach (var word in row.WordItems)
             {
-                word.Transform.ScaleX = Approach(word.Transform.ScaleX, row.Scale);
+                word.Transform.ScaleX = _motion ? Approach(word.Transform.ScaleX, row.Scale) : row.Scale;
                 word.Transform.ScaleY = word.Transform.ScaleX;
+                settled &= word.Transform.ScaleX == row.Scale;
+            }
+
+            if (settled)
+            {
+                row.Settling = false;
+                _settling.RemoveAt(index);
             }
         }
 
@@ -574,16 +605,25 @@ internal sealed class LyricsPanel : IDisposable
             return;
         }
 
-        var motion = Koda.Core.Settings.Current.LyricsMotion;
         foreach (var word in current.WordItems)
         {
-            Paint(word, time, motion);
+            Paint(word, time, _motion);
         }
 
         foreach (var word in current.BackgroundItems)
         {
-            Paint(word, time, motion);
+            Paint(word, time, _motion);
         }
+    }
+
+    private void SetAppearance(Row row, double opacity, double scale)
+    {
+        if (row.Opacity == opacity && row.Scale == scale) return;
+        row.Opacity = opacity;
+        row.Scale = scale;
+        if (row.Settling) return;
+        row.Settling = true;
+        _settling.Add(row);
     }
 
     /// <summary>
@@ -597,8 +637,8 @@ internal sealed class LyricsPanel : IDisposable
         var leading = false;
         var progress = 0.0;
 
-        var current = Lyrics.IndexOf(time, _lyricLines);
-        if (current is null)
+        var index = _currentIndex;
+        if (index < 0)
         {
             if (_lyricLines.Count > 0 && _lyricLines[0].Time >= InterludeSeconds && time >= 0)
             {
@@ -608,7 +648,6 @@ internal sealed class LyricsPanel : IDisposable
         }
         else
         {
-            var index = current.Value;
             if (index + 1 < _lyricLines.Count &&
                 _lyricLines[index].End is { } end &&
                 _lyricLines[index + 1].Time - end >= InterludeSeconds &&
@@ -617,19 +656,14 @@ internal sealed class LyricsPanel : IDisposable
                 active = _rows[index];
                 progress = Math.Clamp((time - end) / (_lyricLines[index + 1].Time - end), 0, 1);
                 // The line just sung rests while the gap plays, as it does on the Mac.
-                active.Opacity = 0.5;
-                active.Scale = 0.99;
+                SetAppearance(active, 0.5, 0.99);
             }
         }
 
-        foreach (var row in _rows)
+        if (_visibleGap != active)
         {
-            if (row.DotsHost is null || ReferenceEquals(row, active))
-            {
-                continue;
-            }
-
-            row.DotsHost.Visibility = Visibility.Collapsed;
+            if (_visibleGap?.DotsHost is { } previous) previous.Visibility = Visibility.Collapsed;
+            _visibleGap = active;
         }
 
         if (active?.DotsHost is { } host)
@@ -637,11 +671,10 @@ internal sealed class LyricsPanel : IDisposable
             host.Visibility = Visibility.Visible;
             FillDots(active.Dots, progress);
         }
-        else if (current is { } index && index < _rows.Count)
+        else if (active is null && _current is { } current)
         {
             // Coming back out of a gap (a seek, a replay) lights the line again.
-            _rows[index].Opacity = 1;
-            _rows[index].Scale = 1;
+            SetAppearance(current, 1, 1);
         }
 
         if (_leadingDots is not null)
@@ -732,6 +765,11 @@ internal sealed class LyricsPanel : IDisposable
         }
 
         _tween.Stop();
+        if (!_motion)
+        {
+            _scroll.ChangeView(null, target, null, disableAnimation: true);
+            return;
+        }
         _tweenStart = start;
         _tweenTarget = target;
         _tweenElapsed = 0;

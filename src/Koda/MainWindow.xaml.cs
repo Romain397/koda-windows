@@ -56,7 +56,6 @@ public sealed partial class MainWindow : Window
     private nint _previousWndProc;
     private bool _placementApplied;
     private bool _scrubbing;
-    private bool _suppressVolumePersistence;
     private string? _currentTag;
     private string? _notifiedSongId;
     private string _playlistSignature = "";
@@ -64,7 +63,6 @@ public sealed partial class MainWindow : Window
     private readonly List<NavigationViewItem> _playlistItems = [];
     private PinDrag? _pinDrag;
     private sealed record PinDrag(PlaylistReference Playlist, string Profile);
-    private DispatcherQueueTimer? _volumeSaveTimer;
     private DispatcherQueueTimer? _statusTimer;
     private DispatcherQueueTimer? _suggestTimer;
     private CancellationTokenSource? _suggestCancel;
@@ -136,9 +134,11 @@ public sealed partial class MainWindow : Window
         Playback.QueueChanged += OnQueueModesChanged;
         Playback.PlayStateChanged += OnPlayStateChanged;
         Playback.PositionTick += OnPositionTick;
+        Playback.VolumeChanged += UpdateVolume;
         Playback.StatusRaised += OnStatusRaised;
         Video.Connect(dispatch);
         Video.StartTimers();
+        Playback.VolumeChanged += () => Video.SetVolume(Playback.VolumePercent);
         Video.Changed += () => dispatch.TryEnqueue(UpdateVideoBar);
         Video.Tick += () => dispatch.TryEnqueue(UpdateVideoBarTime);
         Scrubbing.Attach(VideoScrubber, on => _videoScrubbing = on, Video.Seek, () => Video.HasVideo);
@@ -152,7 +152,7 @@ public sealed partial class MainWindow : Window
         });
         UpdateProfileItem();
         App.Library.Changed += () => dispatch.TryEnqueue(RefreshSidebar);
-        App.AudioStore.Changed += () => dispatch.TryEnqueue(RefreshSidebar);
+        App.AudioStore.Changed += () => dispatch.TryEnqueue(RefreshDownloadsBadge);
         PlaylistCovers.Changed += OnPlaylistCoverChanged;
         App.Library.Changed += () => dispatch.TryEnqueue(UpdateLike);
         App.Settings.Changed += _ => dispatch.TryEnqueue(ApplySkipSettings);
@@ -167,14 +167,7 @@ public sealed partial class MainWindow : Window
             if (_scrubbing) ElapsedText.Text = FormatTime(Scrubber.Value);
         };
 
-        _suppressVolumePersistence = true;
-        VolumeSlider.Value = App.Volume;
-        _suppressVolumePersistence = false;
-
-        _volumeSaveTimer = dispatch.CreateTimer();
-        _volumeSaveTimer.Interval = TimeSpan.FromMilliseconds(600);
-        _volumeSaveTimer.IsRepeating = false;
-        _volumeSaveTimer.Tick += (_, _) => App.SetVolume(VolumeSlider.Value);
+        UpdateVolume();
 
         _statusTimer = dispatch.CreateTimer();
         _statusTimer.Interval = TimeSpan.FromSeconds(6);
@@ -579,13 +572,15 @@ public sealed partial class MainWindow : Window
 
     private void RefreshSidebar()
     {
-        SetBadge(LikedItem, App.Library.Liked.Length);
-        SetBadge(DownloadsItem, App.AudioStore.Downloads.Length);
+        SetBadge(LikedItem, App.Library.LikedCount);
+        RefreshDownloadsBadge();
         RebuildPlaylists();
         UpdatePlaylistPlayback();
         UpdateGlance();
         UpdateUpNext();
     }
+
+    private void RefreshDownloadsBadge() => SetBadge(DownloadsItem, App.AudioStore.DownloadCount);
 
     private void OnPlaylistCoverChanged(PlaylistReference playlist)
     {
@@ -689,13 +684,7 @@ public sealed partial class MainWindow : Window
         if (playlist is null) return item;
 
         menu.Items.Add(new MenuFlyoutSeparator());
-        var play = SongMenu.Item("Play", "\uE768", () =>
-        {
-            if (playlist.Songs.Length > 0)
-            {
-                _ = Playback.PlayNowAsync(playlist.Songs[0], playlist.Songs, source);
-            }
-        });
+        var play = SongMenu.Item("Play", "\uE768", () => _ = Playback.PlayPlaylistAsync(playlist.Songs, source));
         play.IsEnabled = playlist.Songs.Length > 0;
         menu.Items.Add(play);
         var queue = SongMenu.Item("Add to queue", "\uE71C", () => Playback.AddToQueue(playlist.Songs, playlist: source));
@@ -799,7 +788,7 @@ public sealed partial class MainWindow : Window
     /// <summary>The song after this one, as a row of the pane; invoked, it opens the queue.</summary>
     private void UpdateUpNext()
     {
-        var next = Playback.Queue.Upcoming.FirstOrDefault();
+        var next = Playback.Queue.PeekNext(automatic: false);
         _hasUpNext = next is not null;
         UpNextTitle.Text = next?.Song.Title ?? "";
         UpNextArtist.Text = next is null || string.IsNullOrEmpty(next.Song.ArtistLine)
@@ -816,7 +805,11 @@ public sealed partial class MainWindow : Window
 
     private void ShowQueue()
     {
-        if (Playback.CurrentSong is not null && ContentFrame.Content is not NowPlayingPage)
+        if (ContentFrame.Content is NowPlayingPage player)
+        {
+            player.ShowQueue();
+        }
+        else if (Playback.CurrentSong is not null)
         {
             ContentFrame.Navigate(typeof(NowPlayingPage), "queue", new Microsoft.UI.Xaml.Media.Animation.DrillInNavigationTransitionInfo());
         }
@@ -1167,7 +1160,6 @@ public sealed partial class MainWindow : Window
         PreviousButton.IsEnabled = song is not null;
         QueueButton.IsEnabled = MiniButton.IsEnabled = ShuffleButton.IsEnabled = RepeatButton.IsEnabled = song is not null;
         SkipBackButton.IsEnabled = SkipForwardButton.IsEnabled = song is not null && !Playback.IsLoading;
-        _smtc.SetTransport(song is not null, Playback.CanPrev, Playback.CanNext);
         Scrubber.Maximum = Math.Max(1, Playback.DurationSeconds);
         Scrubber.Value = Math.Clamp(Playback.PositionSeconds, 0, Scrubber.Maximum);
         ElapsedText.Text = song is null ? "" : FormatTime(Scrubber.Value);
@@ -1240,6 +1232,7 @@ public sealed partial class MainWindow : Window
             _ => "Repeat off",
         });
         NextButton.IsEnabled = Playback.CanNext;
+        _smtc.SetTransport(Playback.CurrentSong is not null, Playback.CanPrev, Playback.CanNext);
         UpdateUpNext();
     }
 
@@ -1249,9 +1242,9 @@ public sealed partial class MainWindow : Window
 
     private void OnQueueClick(object sender, RoutedEventArgs e)
     {
-        if (ContentFrame.Content is NowPlayingPage)
+        if (ContentFrame.Content is NowPlayingPage player)
         {
-            GoBack();
+            player.ShowQueue(toggle: true);
         }
         else if (Playback.CurrentSong is not null)
         {
@@ -1321,8 +1314,6 @@ public sealed partial class MainWindow : Window
 
     private void OnPositionTick()
     {
-        // The like state is read again each tick too: a cheap belt to the Changed braces.
-        if (LikeButton.Visibility == Visibility.Visible) UpdateLike();
         UpdateTaskbar();
         var duration = Playback.DurationSeconds;
         if (duration <= 0 || _scrubbing)
@@ -1384,26 +1375,21 @@ public sealed partial class MainWindow : Window
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(SkipForwardButton, ahead);
     }
 
-    private void OnMuteClick(object sender, RoutedEventArgs e)
+    private void OnMuteClick(object sender, RoutedEventArgs e) => Playback.SetMuted(!Playback.IsMuted);
+
+    private void UpdateVolume()
     {
-        Playback.SetMuted(!Playback.IsMuted);
+        VolumeSlider.Value = Playback.VolumePercent;
         MuteIcon.Glyph = Playback.IsMuted ? "" : "";
-        ToolTipService.SetToolTip(MuteButton, Playback.IsMuted ? "Unmute" : "Mute");
+        var label = Playback.IsMuted ? "Unmute" : "Mute";
+        ToolTipService.SetToolTip(MuteButton, label);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(MuteButton, label);
     }
 
     private void OnOutputClick(object sender, RoutedEventArgs e) => AudioOutputMenu.Show(OutputButton);
 
-    private void OnVolumeChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
-    {
+    private void OnVolumeChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e) =>
         Playback.SetVolumePercent(e.NewValue);
-        if (_suppressVolumePersistence)
-        {
-            return;
-        }
-
-        _volumeSaveTimer?.Stop();
-        _volumeSaveTimer?.Start();
-    }
 
     private void OnPlayerBarSizeChanged(object sender, SizeChangedEventArgs e)
     {

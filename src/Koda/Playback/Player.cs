@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using Koda.Core;
+using Koda.Core.Playback;
 using Microsoft.UI.Dispatching;
 using Windows.Devices.Enumeration;
 using Windows.Media.Playback;
@@ -42,7 +43,9 @@ public sealed class Player : IDisposable
     private DeviceInformation? _device;
     private double _volume = 1;
     private bool _muted;
-    private bool _normalizes = true;
+    private LoudnessLevel? _loudness = LoudnessLevel.Normal;
+    private double _mainLevel = 1;
+    private double _tailLevel = 1;
     private double _crossfadeSeconds = 5;
     private bool _crossfades = true;
     /// <summary>The listener asked the main voice to play.</summary>
@@ -134,15 +137,13 @@ public sealed class Player : IDisposable
         }
     }
 
-    /// <summary>Bring loud masters down to YouTube's loudness target.</summary>
-    public bool NormalizesVolume
+    public void SetLoudness(LoudnessLevel? loudness)
     {
-        get => _normalizes;
-        set
-        {
-            _normalizes = value;
-            ApplyGains();
-        }
+        if (_loudness == loudness) return;
+        _loudness = loudness;
+        _mainLevel = LoudnessNormalization.Gain(loudness, _main?.Stream.LoudnessDb);
+        _tailLevel = LoudnessNormalization.Gain(loudness, _tail?.Stream.LoudnessDb);
+        ApplyGains();
     }
 
     public bool Crossfades
@@ -187,8 +188,10 @@ public sealed class Player : IDisposable
         DiscardStandby();
         Retire(fadeIn);
         _main = NewVoice(stream, song, occurrence, startAtSeconds);
+        _mainLevel = LoudnessNormalization.Gain(_loudness, stream.LoudnessDb);
+        ResetEndWatch();
         StartFadeIn(fadeIn);
-        _main.Open(App.AudioStore);
+        _main.Open();
         if (_playing)
         {
             _main.Play();
@@ -209,7 +212,7 @@ public sealed class Player : IDisposable
         DiscardStandby();
         _standby = NewVoice(stream, song, occurrence, 0);
         _standby.Gain = 0;
-        _standby.Open(App.AudioStore);
+        _standby.Open();
     }
 
     public void DiscardStandby()
@@ -231,6 +234,8 @@ public sealed class Player : IDisposable
         _standby = null;
         Retire(fade);
         _main = next;
+        _mainLevel = LoudnessNormalization.Gain(_loudness, next.Stream.LoudnessDb);
+        ResetEndWatch();
         StartFadeIn(fade);
         _playing = true;
         next.Play();
@@ -307,10 +312,14 @@ public sealed class Player : IDisposable
 
             StateReached?.Invoke(state);
         });
+        return voice;
+    }
+
+    private void ResetEndWatch()
+    {
         _lastPosition = -1;
         _crossfadeRaised = false;
         _nearEndRaised = false;
-        return voice;
     }
 
     /// <summary>Run <paramref name="action"/> on the UI thread if <paramref name="voice"/> is still main then.</summary>
@@ -343,7 +352,8 @@ public sealed class Player : IDisposable
         }
 
         _tail = old;
-        _tailFrom = MainGain(old);
+        _tailLevel = _mainLevel;
+        _tailFrom = _fadeGain;
         _tailStart = Now;
         _tailLength = fade;
         EnsureClock();
@@ -380,21 +390,14 @@ public sealed class Player : IDisposable
 
     private double Now => _time.Elapsed.TotalSeconds;
 
-    /// <summary>The levelling a song gets: loud masters come down to -14 LUFS; quiet ones are
-    /// left alone rather than boosted, and nothing drops below 40%.</summary>
-    private double Leveling(Voice voice) =>
-        _normalizes && voice.Stream.LoudnessDb is { } db && db > 0
-            ? Math.Max(0.4, Math.Pow(10, -db / 20))
-            : 1;
-
-    private double MainGain(Voice voice) => _volume * Leveling(voice) * _fadeGain;
-
     private void ApplyGains()
     {
-        if (_main is { } main)
-        {
-            main.Gain = MainGain(main);
-        }
+        var main = _main is null ? 0 : _mainLevel * _fadeGain;
+        var tail = _tail is null ? 0 : _tailLevel * _tailFrom
+            * Math.Cos(Math.Min(1, (Now - _tailStart) / _tailLength) * Math.PI / 2);
+        var gains = LoudnessNormalization.LimitOverlap(main, tail);
+        if (_main is not null) _main.Gain = _volume * gains.Main;
+        if (_tail is not null) _tail.Gain = _volume * gains.Tail;
     }
 
     private System.Collections.Generic.IEnumerable<Voice> Voices()
@@ -417,10 +420,7 @@ public sealed class Player : IDisposable
             return;
         }
 
-        if (_fadeInLength > 0 || _tail is not null)
-        {
-            clock.Interval = TimeSpan.FromMilliseconds(33);
-        }
+        UpdateClockInterval(clock, _fadeInLength > 0 || _tail is not null);
 
         if (!clock.IsRunning)
         {
@@ -433,27 +433,23 @@ public sealed class Player : IDisposable
     private void Tick()
     {
         var now = Now;
+        var wasFading = _fadeInLength > 0 || _tail is not null;
         if (_fadeInLength > 0)
         {
             var progress = Math.Min(1, (now - _fadeInStart) / _fadeInLength);
             _fadeGain = Math.Sin(progress * Math.PI / 2);
-            ApplyGains();
             if (progress >= 1)
             {
                 _fadeInLength = 0;
             }
         }
 
-        if (_tail is { } tail)
+        if (_tail is not null && now - _tailStart >= _tailLength)
         {
-            var progress = Math.Min(1, (now - _tailStart) / _tailLength);
-            tail.Gain = _tailFrom * Math.Cos(progress * Math.PI / 2);
-            if (progress >= 1)
-            {
-                FinishTail();
-            }
+            FinishTail();
         }
 
+        if (wasFading) ApplyGains();
         WatchEnd();
 
         var fading = _fadeInLength > 0 || _tail is not null;
@@ -464,8 +460,14 @@ public sealed class Player : IDisposable
         else if (_clock is { } clock)
         {
             // Smooth while a fade runs; a few looks a second are enough to watch for the end.
-            clock.Interval = TimeSpan.FromMilliseconds(fading ? 33 : 150);
+            UpdateClockInterval(clock, fading);
         }
+    }
+
+    private static void UpdateClockInterval(DispatcherQueueTimer clock, bool fading)
+    {
+        var interval = TimeSpan.FromMilliseconds(fading ? 33 : 150);
+        if (clock.Interval != interval) clock.Interval = interval;
     }
 
     private void WatchEnd()

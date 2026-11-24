@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text.Json;
 using System.Threading.Tasks;
 using Koda.Core;
 using Koda.Interop;
@@ -36,17 +35,17 @@ public sealed class PlaybackService
         Fault,
     }
 
-    private static string QueuePath => Path.Combine(App.DataDirectory, "queue.json");
-
     /// <summary>How long the player may wait on the network, wanting to play, before the song is
     /// reloaded where it was; half that for a song that never got going.</summary>
     private static readonly TimeSpan StallTimeout = TimeSpan.FromSeconds(15);
 
     private readonly Player _player = new();
+    private readonly QueueStateStore _queueStore = new(Path.Combine(App.DataDirectory, "queue.json"));
     private PlayQueue _queue = new();
     private DispatcherQueue? _dispatch;
     private SmtcController? _smtc;
     private DispatcherQueueTimer? _positionTimer;
+    private DispatcherQueueTimer? _volumeSaveTimer;
     private ResolvedStream? _currentStream;
     /// <summary>The current song's audio is loaded into the player (false after a relaunch until Play).</summary>
     private bool _loaded;
@@ -67,6 +66,7 @@ public sealed class PlaybackService
     private bool IsListeningProfile => !Profiles.IsSwitching && _listeningProfile == Profiles.Roster.ActiveId;
     /// <summary>Bumped per load ahead, so a slow resolve for a next song that changed is dropped.</summary>
     private int _nextGeneration;
+    private (Guid Current, Guid Next)? _preparingNext;
     private int _reportedGeneration = -1;
     private double _resumeAt;
     /// <summary>Since when the player has been waiting on the network while the listener wants sound.</summary>
@@ -90,6 +90,8 @@ public sealed class PlaybackService
 
     /// <summary>Twice a second: scrubbers and SMTC timeline.</summary>
     public event Action? PositionTick;
+
+    public event Action? VolumeChanged;
 
     /// <summary>Non-blocking status line for the shell ribbon (never a dialog).</summary>
     public event Action<StatusTone, string>? StatusRaised;
@@ -121,7 +123,8 @@ public sealed class PlaybackService
         _player.State is MediaPlayerState.Opening or MediaPlayerState.Buffering ||
         (_loaded && _player.State == MediaPlayerState.Closed));
 
-    public bool IsMuted { get; private set; }
+    public bool IsMuted => _player.Muted;
+    public double VolumePercent => _player.Volume;
 
     /// <summary>When the queue ends, the radio of the last song keeps it going. The listener's
     /// choice, kept with the other settings.</summary>
@@ -152,6 +155,8 @@ public sealed class PlaybackService
         _player.StateReached += OnStateReached;
         _player.NearEnd += () => _ = PrepareNextAsync();
         _player.CrossfadeDue += OnCrossfadeDue;
+        _player.Volume = App.Volume;
+        _player.Muted = App.Settings.MusicMuted;
         ApplyAudioSettings(Koda.Core.Settings.Current);
         Koda.Core.Settings.Current.Changed += settings => dispatch.TryEnqueue(() => ApplyAudioSettings(settings));
 
@@ -163,7 +168,11 @@ public sealed class PlaybackService
         _positionTimer = dispatch.CreateTimer();
         _positionTimer.Interval = TimeSpan.FromMilliseconds(500);
         _positionTimer.Tick += (_, _) => OnPositionTimer();
-        _positionTimer.Start();
+
+        _volumeSaveTimer = dispatch.CreateTimer();
+        _volumeSaveTimer.Interval = TimeSpan.FromMilliseconds(500);
+        _volumeSaveTimer.IsRepeating = false;
+        _volumeSaveTimer.Tick += (_, _) => SaveVolume();
 
         // The sleep timer counts wall-clock seconds, even while paused: it is the listener's
         // "stop by then", not a count of played time.
@@ -182,7 +191,8 @@ public sealed class PlaybackService
 
     private void ApplyAudioSettings(Koda.Core.Settings settings)
     {
-        _player.NormalizesVolume = settings.NormalizesVolume;
+        _player.SetLoudness(settings.NormalizesVolume ? settings.VolumeNormalizationLevel : null);
+        if (_player.Crossfades == settings.Crossfades && _player.CrossfadeSeconds == settings.CrossfadeSeconds) return;
         _player.Crossfades = settings.Crossfades;
         _player.CrossfadeSeconds = settings.CrossfadeSeconds;
         // A crossfade turned on near the end needs the next song loaded now, not next song.
@@ -191,14 +201,30 @@ public sealed class PlaybackService
 
     private void OnStateReached(MediaPlayerState state)
     {
-        if (state == MediaPlayerState.Playing)
+        if (state == MediaPlayerState.Playing && _wantsToPlay)
         {
             _resolving = false;
             ReportStart();
         }
 
-        PlayStateChanged?.Invoke();
+        NotifyPlayState();
         _smtc?.UpdatePlaybackState(_wantsToPlay && state == MediaPlayerState.Playing, _stopped);
+    }
+
+    private void NotifyPlayState()
+    {
+        if (_positionTimer is { } timer)
+        {
+            var running = _wantsToPlay && _loaded;
+            if (running && !timer.IsRunning) timer.Start();
+            else if (!running && timer.IsRunning)
+            {
+                timer.Stop();
+                PositionTick?.Invoke();
+            }
+        }
+
+        PlayStateChanged?.Invoke();
     }
 
     private void OnPositionTimer()
@@ -289,21 +315,25 @@ public sealed class PlaybackService
     {
         var list = context.Count > 0 ? context : [song];
         var index = Math.Max(0, list.ToList().FindIndex(s => s.Id == song.Id));
-        _queue.Replace(list, index, source: SourceOf(playlist)); // repeat stays with the listener, not the list
-        QueueChanged?.Invoke();
-        return PlayCurrentAsync();
+        return StartQueueAsync(list, playlist, index, shuffled: playlist is not null && _queue.IsShuffled);
     }
 
+    /// <summary>Start a playlist using the listener's current shuffle setting.</summary>
+    public Task PlayPlaylistAsync(IReadOnlyList<Song> songs, PlaylistReference playlist) =>
+        StartQueueAsync(songs, playlist, start: null, shuffled: _queue.IsShuffled);
+
     /// <summary>The songs in a shuffled order (the queue's shuffle on).</summary>
-    public Task ShuffleAsync(IReadOnlyList<Song> songs, PlaylistReference? playlist = null)
+    public Task ShuffleAsync(IReadOnlyList<Song> songs, PlaylistReference? playlist = null) =>
+        StartQueueAsync(songs, playlist, start: null, shuffled: true);
+
+    private Task StartQueueAsync(IReadOnlyList<Song> songs, PlaylistReference? playlist, int? start, bool shuffled)
     {
         if (songs.Count == 0)
         {
             return Task.CompletedTask;
         }
 
-        _queue.Replace(songs, Random.Shared.Next(songs.Count), shuffled: true, source: SourceOf(playlist));
-        QueueChanged?.Invoke();
+        _queue.Replace(songs, start, shuffled, SourceOf(playlist));
         return PlayCurrentAsync();
     }
 
@@ -393,6 +423,10 @@ public sealed class PlaybackService
             _player.Pause();
             SaveQueue(); // the place survives a crash while paused
         }
+        else if (_resolving)
+        {
+            _wantsToPlay = true;
+        }
         else if (!_loaded)
         {
             // After a relaunch the song is shown but not loaded; Play loads it where it was.
@@ -404,7 +438,7 @@ public sealed class PlaybackService
             _player.Play();
         }
 
-        PlayStateChanged?.Invoke();
+        NotifyPlayState();
         _smtc?.UpdatePlaybackState(_wantsToPlay && _player.State == MediaPlayerState.Playing, _stopped);
     }
 
@@ -427,6 +461,7 @@ public sealed class PlaybackService
 
         ++_generation;
         ++_nextGeneration;
+        _preparingNext = null;
         _wantsToPlay = false;
         _stopped = true;
         _loaded = false;
@@ -438,7 +473,7 @@ public sealed class PlaybackService
         SaveQueue();
         _smtc?.UpdatePlaybackState(playing: false, stopped: true);
         _smtc?.SetTimeline(0, DurationSeconds);
-        PlayStateChanged?.Invoke();
+        NotifyPlayState();
         PositionTick?.Invoke();
     }
 
@@ -652,7 +687,7 @@ public sealed class PlaybackService
         {
             _wantsToPlay = false;
             _player.Pause();
-            PlayStateChanged?.Invoke();
+            NotifyPlayState();
             SaveQueue();
         }
 
@@ -660,12 +695,28 @@ public sealed class PlaybackService
         StatusRaised?.Invoke(StatusTone.Pacing, "Sleep timer ended: playback paused.");
     }
 
-    public void SetVolumePercent(double percent) => _player.Volume = percent;
+    public void SetVolumePercent(double percent)
+    {
+        if (_volumeSaveTimer is not { } timer || !double.IsFinite(percent)) return;
+        percent = Math.Clamp(percent, 0, 100);
+        if (Math.Abs(VolumePercent - percent) < 0.001) return;
+        _player.Volume = percent;
+        timer.Stop();
+        timer.Start();
+        VolumeChanged?.Invoke();
+    }
+
+    private void SaveVolume()
+    {
+        if (Math.Abs(VolumePercent - App.Volume) >= 0.001) App.SetVolume(VolumePercent);
+    }
 
     public void SetMuted(bool muted)
     {
-        IsMuted = muted;
+        if (IsMuted == muted) return;
         _player.Muted = muted;
+        App.Settings.Update(settings => settings.MusicMuted = muted);
+        VolumeChanged?.Invoke();
     }
 
     // MARK: queue edits and modes
@@ -678,11 +729,16 @@ public sealed class PlaybackService
         }
     }
 
-    public void ClearUpcoming()
+    public PlayQueue.ClearedUpcoming? ClearUpcoming()
     {
-        _queue.ClearUpcoming();
-        QueueEdited();
-        TrackChanged?.Invoke();
+        var cleared = _queue.ClearUpcoming();
+        if (cleared is not null) QueueEdited();
+        return cleared;
+    }
+
+    public void RestoreUpcoming(PlayQueue.ClearedUpcoming cleared)
+    {
+        if (_queue.RestoreUpcoming(cleared)) QueueEdited();
     }
 
     public void MoveUpcoming(int from, int to)
@@ -717,7 +773,7 @@ public sealed class PlaybackService
     }
 
     /// <summary>More songs at the end, for a queue list scrolled to its end: the radio of the last song.</summary>
-    public Task LoadMoreAsync() => Autoplay ? ExtendWithRadioAsync(thenAdvance: false) : Task.CompletedTask;
+    public Task LoadMoreAsync() => CanPrefetchRadio ? ExtendWithRadioAsync(thenAdvance: false) : Task.CompletedTask;
 
     public bool IsExtending => _extending;
 
@@ -735,7 +791,7 @@ public sealed class PlaybackService
     /// <summary>Load and play the queue's current song. <paramref name="fade"/> is a change of
     /// song the listener asked for: with crossfade on, the song playing fades out quickly while
     /// this one loads and fades in. A reload of the same song after a failure never fades.</summary>
-    private async Task PlayCurrentAsync(double resumeAt = 0, bool fade = true)
+    private async Task PlayCurrentAsync(double resumeAt = 0, bool fade = true, bool useLocal = true)
     {
         if (_queue.Current is not { } item)
         {
@@ -766,7 +822,7 @@ public sealed class PlaybackService
 
         TrackChanged?.Invoke();
         QueueChanged?.Invoke();
-        PlayStateChanged?.Invoke();
+        NotifyPlayState();
         SaveQueue();
         UpdateSmtcTrack(song);
         if (!EnsureOutput())
@@ -778,14 +834,14 @@ public sealed class PlaybackService
         try
         {
             // The whole song on disk plays from the file, with no connection needed.
-            stream = await ResolveAsync(song);
+            stream = await ResolveAsync(song, useLocal);
         }
         catch (MusicException error)
         {
             if (generation != _generation) return;
             _resolving = false;
             _wantsToPlay = false;
-            PlayStateChanged?.Invoke();
+            NotifyPlayState();
             Report(error);
             return;
         }
@@ -798,15 +854,15 @@ public sealed class PlaybackService
         _currentStream = stream;
         // The start position travels with the load: the media opens a moment later, and the
         // song must not sound its first second before it moves.
-        _player.Load(stream, song, item.Id, resumeAt, fadeIn);
+        _player.Load(stream, song, item.Id, _resumeAt, _wantsToPlay ? fadeIn : 0);
         _loaded = true;
         if (_wantsToPlay) _player.Play();
         else _resolving = false;
         BeganSong(song);
     }
 
-    private static async Task<ResolvedStream> ResolveAsync(Song song) =>
-        App.AudioStore.CompleteStream(song.Id) ?? await EngineHost.Music.StreamAsync(song.Id);
+    private static async Task<ResolvedStream> ResolveAsync(Song song, bool useLocal = true) =>
+        (useLocal ? App.AudioStore.CompleteStream(song.Id) : null) ?? await EngineHost.Music.StreamAsync(song.Id);
 
     /// <summary>What every new play of a song does once its audio is in the player.</summary>
     private void BeganSong(Song song)
@@ -814,10 +870,9 @@ public sealed class PlaybackService
         if (IsListeningProfile)
         {
             App.Library.RecordPlay(song);
-            App.Library.Flush(); // the listening time of the finished song is on disk now
         }
         TrackChanged?.Invoke(); // the exact duration is known now
-        PlayStateChanged?.Invoke();
+        NotifyPlayState();
         Koda.Services.LyricsService.Prefetch(song); // the words are ready before anyone asks
         _ = TopUpAsync();
         _ = PrepareNextAsync();
@@ -890,13 +945,15 @@ public sealed class PlaybackService
             return;
         }
 
-        if (_player.StandbyOccurrence == next.Id)
+        var request = (current.Id, next.Id);
+        if (_player.StandbyOccurrence == next.Id || _preparingNext == request)
         {
             return;
         }
 
         _player.DiscardStandby();
         var token = ++_nextGeneration;
+        _preparingNext = request;
         ResolvedStream stream;
         try
         {
@@ -909,6 +966,10 @@ public sealed class PlaybackService
         catch (MusicException)
         {
             return; // loaded again, the ordinary way, when it is reached
+        }
+        finally
+        {
+            if (_nextGeneration == token) _preparingNext = null;
         }
 
         if (token != _nextGeneration || !_loaded || _queue.Current?.Id != current.Id ||
@@ -936,9 +997,13 @@ public sealed class PlaybackService
         BeginStandby(fade);
     }
 
+    // Let playlists reach their end before adding radio, so enabling repeat keeps the playlist intact.
+    private bool CanPrefetchRadio => Autoplay && _queue.Repeat == RepeatMode.Off
+        && !(_queue.IsPlaylist && _queue.Current?.Source is not null);
+
     /// <summary>Autoplay keeps something waiting: with the last songs reached, the radio follows.</summary>
     private Task TopUpAsync() =>
-        Autoplay && _queue.Repeat == RepeatMode.Off && _queue.Upcoming.Count < 2
+        CanPrefetchRadio && _queue.UpcomingCount < 2
             ? ExtendWithRadioAsync(thenAdvance: false)
             : Task.CompletedTask;
 
@@ -946,7 +1011,7 @@ public sealed class PlaybackService
     /// the songs the listener asked to hear less of.</summary>
     private async Task ExtendWithRadioAsync(bool thenAdvance)
     {
-        if (_extending || _queue.Items.Count == 0)
+        if (_extending || !Autoplay || _queue.Repeat != RepeatMode.Off || _queue.IsEmpty)
         {
             return;
         }
@@ -959,7 +1024,7 @@ public sealed class PlaybackService
         try
         {
             var radio = await EngineHost.Music.RadioAsync(last.Id);
-            if (_queue.Current?.Id != anchor || generation != _generation)
+            if (_queue.Current?.Id != anchor || generation != _generation || !Autoplay || _queue.Repeat != RepeatMode.Off)
             {
                 return;
             }
@@ -997,7 +1062,7 @@ public sealed class PlaybackService
 
     private async Task OnEndedAsync()
     {
-        if (_stopped) return;
+        if (_stopped || !_wantsToPlay) return;
         // A player that runs out of samples says "ended" for two reasons: the song
         // finished, or the bytes stopped coming (a refused range, a stall). Only the
         // second one must not move the queue on - otherwise the listener loses the
@@ -1030,7 +1095,7 @@ public sealed class PlaybackService
                 _player.Seek(0);
             }
 
-            PlayStateChanged?.Invoke();
+            NotifyPlayState();
             SleepChanged?.Invoke();
             StatusRaised?.Invoke(StatusTone.Pacing, "Sleep timer ended: stopped after the song.");
             return;
@@ -1074,7 +1139,7 @@ public sealed class PlaybackService
         _wantsToPlay = false;
         _player.Pause();
         _player.Seek(0);
-        PlayStateChanged?.Invoke();
+        NotifyPlayState();
     }
 
     private async Task RecoverAsync(string reason)
@@ -1098,7 +1163,7 @@ public sealed class PlaybackService
             _wantsToPlay = false;
             _resolving = false;
             _player.Pause();
-            PlayStateChanged?.Invoke();
+            NotifyPlayState();
             if (!EnsureOutput()) return;
             StatusRaised?.Invoke(StatusTone.Fault, $"{song.Title} didn't play ({reason}).");
             return;
@@ -1112,16 +1177,11 @@ public sealed class PlaybackService
 
         _recovering = true;
         _failedOnce = true;
-        // Only a whole file that fails to play is damaged and fetched again; the bytes of a
-        // stream that broke part way are good and stay, so the retry does not start over.
-        if (App.AudioStore.GetEntry(song.Id)?.IsComplete == true)
-        {
-            App.AudioStore.Discard(song.Id);
-        }
+        var localFailed = _currentStream?.Url.IsFile == true;
 
         try
         {
-            await EngineHost.Music.StreamFailedAsync(song.Id);
+            if (!localFailed) await EngineHost.Music.StreamFailedAsync(song.Id);
         }
         catch (MusicException error)
         {
@@ -1134,8 +1194,19 @@ public sealed class PlaybackService
             // The listener moved on while the identity was refreshed: nothing to recover.
             if (generation == _generation && CurrentSong?.Id == song.Id)
             {
-                reloaded = true;
-                await PlayCurrentAsync(resumeAt: resumeAt, fade: false);
+                if (_wantsToPlay)
+                {
+                    reloaded = true;
+                    await PlayCurrentAsync(resumeAt: resumeAt, fade: false, useLocal: !localFailed);
+                }
+                else
+                {
+                    _resumeAt = PositionSeconds;
+                    _loaded = _resolving = false;
+                    _currentStream = null;
+                    _player.Stop();
+                    NotifyPlayState();
+                }
             }
         }
         finally
@@ -1155,30 +1226,18 @@ public sealed class PlaybackService
 
     // MARK: persistence (the Mac's persistQueue)
 
-    private sealed record SavedState(PlayQueue.Saved Queue, double Position);
+    private QueueStateStore.State CaptureQueue() => new(_queue.Save(), PositionSeconds);
 
-    private void SaveQueue()
-    {
-        try
-        {
-            var state = new SavedState(_queue.Save(), PositionSeconds);
-            File.WriteAllText(QueuePath, JsonSerializer.Serialize(state));
-        }
-        catch (Exception)
-        {
-            // A queue that can't be saved still plays; it just won't come back next launch.
-        }
-    }
+    private void SaveQueue() => _ = _queueStore.SaveAsync(CaptureQueue());
 
     private void RestoreQueue()
     {
         try
         {
-            if (!File.Exists(QueuePath)) return;
-            var state = JsonSerializer.Deserialize<SavedState>(File.ReadAllText(QueuePath));
+            var state = _queueStore.Load();
             if (state?.Queue?.Songs is not { Length: > 0 }) return;
             _queue = PlayQueue.Restore(state.Queue);
-            _resumeAt = state.Position;
+            _resumeAt = double.IsFinite(state.Position) ? Math.Max(0, state.Position) : 0;
             _loaded = false;
             _wantsToPlay = false;
         }
@@ -1190,12 +1249,17 @@ public sealed class PlaybackService
 
     /// <summary>Write the queue and the place without stopping anything: the end of a
     /// Windows session is not the listener asking Koda to quit.</summary>
-    public void SaveState() => SaveQueue();
+    public void SaveState()
+    {
+        _volumeSaveTimer?.Stop();
+        SaveVolume();
+        _queueStore.SaveAsync(CaptureQueue()).GetAwaiter().GetResult();
+    }
 
     /// <summary>Terminal shutdown: keep the queue and place, stop audio, hand back the SMTC card.</summary>
     public void Shutdown()
     {
-        SaveQueue();
+        SaveState();
         _positionTimer?.Stop();
         App.Library.Flush();
         App.AudioStore.Flush();

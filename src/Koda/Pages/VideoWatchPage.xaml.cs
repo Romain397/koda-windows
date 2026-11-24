@@ -52,7 +52,7 @@ public sealed partial class VideoWatchPage : Page, IVideoPage
             VolumeSlider.Visibility = e.NewSize.Width < 620 ? Visibility.Collapsed : Visibility.Visible;
 
         _settingVolume = true;
-        VolumeSlider.Value = App.Volume;
+        VolumeSlider.Value = PlaybackService.Instance.VolumePercent;
         _settingVolume = false;
     }
 
@@ -417,8 +417,7 @@ public sealed partial class VideoWatchPage : Page, IVideoPage
     private void OnVolumeChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
     {
         if (_settingVolume) return;
-        Player.SetVolume(e.NewValue);
-        App.SetVolume(e.NewValue);
+        PlaybackService.Instance.SetVolumePercent(e.NewValue);
     }
 
     private async void OnCaptionsClick(object sender, RoutedEventArgs e)

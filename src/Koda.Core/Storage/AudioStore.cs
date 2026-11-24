@@ -136,6 +136,11 @@ public sealed class AudioStore
         }
     }
 
+    public int DownloadCount
+    {
+        get { lock (_lock) return _entries.Values.Count(entry => entry.IsDownload); }
+    }
+
     /// <summary>Songs held whole, downloaded or kept from listening, most recently played first: what
     /// plays with no connection.</summary>
     public Song[] CompleteSongs

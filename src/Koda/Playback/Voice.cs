@@ -19,16 +19,15 @@ namespace Koda.Playback;
 /// MediaEnded, which the queue would read as a real track end, so a song is never
 /// swapped into an existing voice.
 ///
-/// The bytes ride our own transport (Koda.Core's CachingLoader over our ranged
-/// HttpClient), because Media Foundation's built-in fetch of googlevideo URLs cannot
-/// survive inside the WinUI host; the store keeps them on disk for the next play.
+/// Online audio is read in bounded ranges through the streaming loader, which keeps
+/// the bytes in memory. Downloaded audio can still be opened from its local file.
 /// </summary>
 internal sealed class Voice : IDisposable
 {
     private readonly MediaPlayer _player;
     private readonly object _gate = new();
     private MediaSource? _source;
-    private Koda.Core.Playback.CachingLoader? _loader;
+    private Koda.Core.Playback.StreamingLoader? _loader;
     private bool _wantsPlay;
     /// <summary>The media opened: from here a position is applied at once.</summary>
     private bool _opened;
@@ -87,23 +86,16 @@ internal sealed class Voice : IDisposable
     /// a MediaStreamSource instead (see Fmp4Audio). The container's head is read first, so the
     /// source attaches a moment after this returns.
     /// [verified October 2026: file URI and stream both ended at 0 s; frames play and seek]</summary>
-    public void Open(Koda.Core.Storage.AudioStore store)
+    public void Open()
     {
         if (Stream.Url.IsFile)
         {
             // A song held whole on disk: the same frames, read from the file.
             _ = OpenFileFramesAsync(Stream.Url.LocalPath);
         }
-        else if (Koda.Core.Playback.CachingLoader.Create(Stream, Song, store) is { } loader)
-        {
-            _loader = loader;
-            _ = OpenFramesAsync(loader, Stream.ContentLength!.Value);
-        }
         else
         {
-            // The Swift nil-loader branch: hand over the plain URL and let the failure
-            // path answer for it if the fetch dies.
-            Attach(MediaSource.CreateFromUri(Stream.Url));
+            _ = OpenFramesAsync();
         }
     }
 
@@ -237,10 +229,18 @@ internal sealed class Voice : IDisposable
         }
     }
 
-    private async Task OpenFramesAsync(Koda.Core.Playback.CachingLoader loader, long length)
+    private async Task OpenFramesAsync()
     {
         try
         {
+            Koda.Core.Playback.StreamingLoader loader;
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _loader = loader = new Koda.Core.Playback.StreamingLoader(Stream);
+            }
+
+            var length = await loader.GetLengthAsync().ConfigureAwait(false);
             async Task<byte[]> Read(long offset, int count, CancellationToken cancellation)
             {
                 var buffer = new byte[Math.Max(0, Math.Min(count, length - offset))];
@@ -416,6 +416,8 @@ internal sealed class Voice : IDisposable
         _player.MediaEnded -= OnMediaEnded;
         _player.MediaFailed -= OnMediaFailed;
         _player.CurrentStateChanged -= OnCurrentStateChanged;
+        _loader?.Dispose();
+        _loader = null;
         try
         {
             _player.Pause();
@@ -429,7 +431,5 @@ internal sealed class Voice : IDisposable
         _player.Dispose();
         _source?.Dispose();
         _source = null;
-        _loader?.Dispose();
-        _loader = null;
     }
 }

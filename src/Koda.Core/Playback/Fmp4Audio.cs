@@ -15,6 +15,8 @@ namespace Koda.Core.Playback;
 /// </summary>
 public sealed class Fmp4Audio
 {
+    private const int MaxBoxPayload = 2 * 1024 * 1024;
+    private const int MaxFramesPerFragment = 16 * 1024;
     /// <summary>Reads up to <c>count</c> bytes at <c>offset</c>; fewer only at the file's end.</summary>
     public delegate Task<byte[]> ReadAt(long offset, int count, CancellationToken cancellation);
 
@@ -66,10 +68,10 @@ public sealed class Fmp4Audio
         while (position + 8 <= length && firstMoof < 0)
         {
             var (size, type, header) = await BoxHeaderAsync(read, position, length, cancellation);
-            if (type == "moov") moov = await ReadExactAsync(read, position + header, (int)(size - header), cancellation);
+            if (type == "moov") moov = await ReadBoxAsync(read, position + header, size - header, cancellation);
             else if (type == "sidx")
             {
-                sidx = await ReadExactAsync(read, position + header, (int)(size - header), cancellation);
+                sidx = await ReadBoxAsync(read, position + header, size - header, cancellation);
                 sidxEnd = position + size;
             }
             else if (type == "moof") firstMoof = position;
@@ -140,7 +142,7 @@ public sealed class Fmp4Audio
         var moofStart = Fragments[index].Offset;
         var (size, type, header) = await BoxHeaderAsync(_read, moofStart, _length, cancellation);
         if (type != "moof") throw new InvalidDataException($"expected moof at {moofStart}, found {type}");
-        var moof = await ReadExactAsync(_read, moofStart + header, (int)(size - header), cancellation);
+        var moof = await ReadBoxAsync(_read, moofStart + header, size - header, cancellation);
         var start = Fragments[index].StartTicks >= 0 ? Fragments[index].StartTicks : fallbackStart;
         return ParseMoof(moof, moofStart, moofStart + size, start, _defaultDuration, _defaultSize);
     }
@@ -148,6 +150,8 @@ public sealed class Fmp4Audio
     /// <summary>The frame's bytes behind a 7-byte ADTS header.</summary>
     public async Task<byte[]> AdtsFrameAsync(Frame frame, CancellationToken cancellation = default)
     {
+        if (frame.Size is <= 0 or > 8184 || frame.Offset < 0 || frame.Offset > _length - frame.Size)
+            throw new InvalidDataException("Invalid AAC sample range.");
         var payload = await ReadExactAsync(_read, frame.Offset, frame.Size, cancellation);
         var length = payload.Length + 7;
         var adts = new byte[length];
@@ -166,6 +170,7 @@ public sealed class Fmp4Audio
 
     private static async Task<(long Size, string Type, int Header)> BoxHeaderAsync(ReadAt read, long at, long length, CancellationToken cancellation)
     {
+        if (at < 0 || at > length - 8) throw new InvalidDataException("Invalid audio box address.");
         var head = await ReadExactAsync(read, at, (int)Math.Min(16, length - at), cancellation);
         long size = BinaryPrimitives.ReadUInt32BigEndian(head);
         var type = System.Text.Encoding.ASCII.GetString(head, 4, 4);
@@ -179,8 +184,14 @@ public sealed class Fmp4Audio
         {
             size = length - at; // to the end of the file
         }
-        if (size < header) throw new InvalidDataException($"bad box size at {at}");
+        if (size < header || size > length - at) throw new InvalidDataException($"bad box size at {at}");
         return (size, type, header);
+    }
+
+    private static Task<byte[]> ReadBoxAsync(ReadAt read, long at, long count, CancellationToken cancellation)
+    {
+        if (count > MaxBoxPayload) throw new InvalidDataException("Audio metadata box is too large.");
+        return ReadExactAsync(read, at, (int)count, cancellation);
     }
 
     private static async Task<byte[]> ReadExactAsync(ReadAt read, long at, int count, CancellationToken cancellation)
@@ -329,6 +340,8 @@ public sealed class Fmp4Audio
                 var body = traf.Slice(at + 8, size - 8);
                 var flags = BinaryPrimitives.ReadUInt32BigEndian(body) & 0xFFFFFF;
                 var count = BinaryPrimitives.ReadUInt32BigEndian(body[4..]);
+                if (count > MaxFramesPerFragment - frames.Count)
+                    throw new InvalidDataException("Audio fragment contains too many frames.");
                 var p = 8;
                 if ((flags & 0x1) != 0) { dataPos = baseOffset + BinaryPrimitives.ReadInt32BigEndian(body[p..]); p += 4; }
                 if ((flags & 0x4) != 0) p += 4;

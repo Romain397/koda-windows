@@ -4,6 +4,7 @@ using System.IO;
 using System.Reflection;
 using System.Threading.Tasks;
 using Koda.Core;
+using Koda.Core.Playback;
 using Koda.Helpers;
 using Koda.Interop;
 using Koda.Services;
@@ -29,6 +30,8 @@ namespace Koda.Pages;
 /// </summary>
 public sealed partial class SettingsPage : Page
 {
+    private static readonly LoudnessLevel?[] LoudnessChoices =
+        [null, LoudnessLevel.Quiet, LoudnessLevel.Normal, LoudnessLevel.Loud];
     private readonly Style _cardStyle;
     private readonly Style _rowStyle;
     private readonly Style _dividerStyle;
@@ -87,7 +90,11 @@ public sealed partial class SettingsPage : Page
         VideoAutoplaySwitch.IsOn = settings.AutoplaysVideos;
         VideoQualityBox.ItemsSource = VideoQualityChoices.Select(q => q == 0 ? "Auto" : $"{q}p").ToArray();
         VideoQualityBox.SelectedIndex = Math.Max(0, Array.IndexOf(VideoQualityChoices, settings.VideoQuality));
-        NormalizeSwitch.IsOn = settings.NormalizesVolume;
+        NormalizeLevelBox.ItemsSource = LoudnessChoices.Select(level => level is { } preset
+            ? $"{preset} ({LoudnessNormalization.TargetLufs(preset)} LUFS)" : "Off").ToArray();
+        var loudness = settings.NormalizesVolume ? settings.VolumeNormalizationLevel : (LoudnessLevel?)null;
+        var selected = Array.IndexOf(LoudnessChoices, loudness);
+        NormalizeLevelBox.SelectedIndex = selected >= 0 ? selected : Array.IndexOf(LoudnessChoices, LoudnessLevel.Normal);
         LosslessDownloadsSwitch.IsOn = settings.UsesLosslessServer;
         RefreshLosslessServer();
         GlobalContentSwitch.IsOn = settings.ShowsGlobalContent;
@@ -133,16 +140,6 @@ public sealed partial class SettingsPage : Page
         }
 
         ThemeBox.SelectedIndex = Array.IndexOf(Enum.GetValues<Theme>(), settings.Theme);
-
-        CacheLimitBox.Items.Clear();
-        foreach (var limit in Enum.GetValues<CacheLimit>())
-        {
-            CacheLimitBox.Items.Add(Size((long)limit));
-        }
-
-        // The cache limit's values are byte counts, so the row is found by its place
-        // in the list, not by its number.
-        CacheLimitBox.SelectedIndex = Array.IndexOf(Enum.GetValues<CacheLimit>(), settings.CacheLimit);
 
         var version = Assembly.GetExecutingAssembly().GetName().Version;
         VersionText.Text = $"Koda {version?.ToString(3) ?? "0.1.0"}";
@@ -582,10 +579,15 @@ public sealed partial class SettingsPage : Page
         Playback.PlaybackService.Instance.SetAutoplay(AutoplaySwitch.IsOn);
     }
 
-    private void OnNormalizeToggled(object sender, RoutedEventArgs e)
+    private void OnNormalizeLevelChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (!_loaded) return;
-        App.Settings.Update(s => s.NormalizesVolume = NormalizeSwitch.IsOn);
+        if (!_loaded || NormalizeLevelBox.SelectedIndex < 0) return;
+        var choice = LoudnessChoices[NormalizeLevelBox.SelectedIndex];
+        App.Settings.Update(s =>
+        {
+            s.NormalizesVolume = choice.HasValue;
+            if (choice is { } level) s.VolumeNormalizationLevel = level;
+        });
     }
 
     private async void OnLosslessDownloadsToggled(object sender, RoutedEventArgs e)
@@ -846,27 +848,19 @@ public sealed partial class SettingsPage : Page
 
     // MARK: storage
 
-    private void OnCacheLimitChanged(object sender, SelectionChangedEventArgs e)
-    {
-        if (!_loaded || CacheLimitBox.SelectedIndex < 0) return;
-        var limit = Enum.GetValues<CacheLimit>()[CacheLimitBox.SelectedIndex];
-        App.Settings.Update(s => s.CacheLimit = limit);
-        App.AudioStore.CacheLimit = (long)limit;
-        RefreshStorage();
-    }
-
     private void OnClearCacheClick(object sender, RoutedEventArgs e)
     {
         App.AudioStore.ClearCache();
         RefreshStorage();
-        Notice("The listening cache is empty.");
+        Notice("Cache from earlier versions cleared. Downloads are kept.");
     }
 
     /// <summary>What is kept on disk, said plainly.</summary>
     private void RefreshStorage()
     {
-        var limit = (long)App.Settings.CacheLimit;
-        CacheSizeText.Text = $"{Size(App.AudioStore.CacheBytes)} of {Size(limit)} used.";
+        var bytes = App.AudioStore.CacheBytes;
+        CacheSizeText.Text = bytes == 0 ? "No old audio cache." : $"{Size(bytes)} on disk.";
+        ClearCacheButton.IsEnabled = bytes > 0;
         ApplySettingsSearch();
     }
 

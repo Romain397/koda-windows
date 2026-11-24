@@ -12,6 +12,7 @@ using Microsoft.UI.Xaml.Documents;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Media;
 using Microsoft.UI.Xaml.Navigation;
+using Microsoft.UI.Windowing;
 
 namespace Koda.Pages;
 
@@ -24,11 +25,8 @@ namespace Koda.Pages;
 /// </summary>
 public sealed partial class NowPlayingPage : Page
 {
-    /// <summary>Whether the queue panel was open, kept for the session as the Mac keeps its panel.</summary>
-    private static bool _queueOpen;
-
-    /// <summary>Whether the lyrics panel was open, kept for the session as the Mac keeps its panel.</summary>
-    private static bool _lyricsOpen;
+    private bool QueueOpen => App.Settings.PlayerPanel == NowPlayingPanel.Queue;
+    private bool LyricsOpen => App.Settings.PlayerPanel == NowPlayingPanel.Lyrics;
 
     /// <summary>Where a side panel is installed: the layout's column, or the narrow host.</summary>
     private enum PanelPlace
@@ -41,7 +39,14 @@ public sealed partial class NowPlayingPage : Page
     private PanelPlace _lyricsPlace = PanelPlace.Layout;
 
     private PlaybackService Playback => PlaybackService.Instance;
-    private readonly ObservableCollection<QueueItem> _upcoming = [];
+    private ObservableCollection<QueueItem> _upcoming = [];
+    private int _upcomingVersion = -1;
+    private int _upcomingStart;
+    private bool _active;
+    private bool _windowVisible;
+    private AppWindow? _appWindow;
+    private bool _queueRefreshPending;
+    private Song? _displayedSong;
     private PlaylistReference? _shownPlaylist;
     private string? _paletteFor;
     private bool _wide = true;
@@ -49,9 +54,15 @@ public sealed partial class NowPlayingPage : Page
     private bool _dragging;
     private QueueItem? _dragged;
     private int _dragFrom;
-    private Song[]? _cleared;
+    private int _dragVersion;
+    private Guid? _dragCurrent;
+    private PlayQueue.ClearedUpcoming? _cleared;
     private readonly DispatcherTimer _undoTimer = new() { Interval = TimeSpan.FromSeconds(6) };
     private ScrollViewer? _queueScroller;
+    private readonly Windows.UI.ViewManagement.UISettings _systemUi = new();
+    private bool SystemMotion => _systemUi.AnimationsEnabled && !EnergySaver.IsOn;
+    private bool _backdropDrifting;
+    private (bool Expanded, bool Animated)? _coverState;
 
     // MARK: lyrics
 
@@ -106,46 +117,49 @@ public sealed partial class NowPlayingPage : Page
     protected override void OnNavigatedTo(NavigationEventArgs args)
     {
         base.OnNavigatedTo(args);
-        if (args.Parameter is "queue")
+        _active = true;
+        _appWindow = App.Shell?.AppWindow;
+        _windowVisible = IsPlayerWindowVisible();
+        if (_appWindow is not null) _appWindow.Changed += OnPlayerWindowChanged;
+        if (args.Parameter is "queue" && !QueueOpen)
         {
             // The player bar's queue button opens the queue directly. The two side panels
             // share one column, so asking for the queue also puts the lyrics away: they
             // were left open from an earlier visit and would otherwise draw on top of it.
-            _queueOpen = true;
-            _lyricsOpen = false;
+            App.Settings.Update(settings => settings.PlayerPanel = NowPlayingPanel.Queue);
         }
 
         Playback.TrackChanged += OnTrackChanged;
         Playback.QueueChanged += OnQueueChanged;
         Playback.PlayStateChanged += OnPlayStateChanged;
         Playback.PositionTick += OnPositionTick;
+        Playback.VolumeChanged += UpdateVolume;
         Playback.SleepChanged += OnSleepChanged;
         App.Library.Changed += OnLibraryChanged;
         Profiles.Roster.Changed += OnProfileChanged;
         PlaylistCovers.Changed += OnPlaylistCoverChanged;
         App.Settings.Changed += OnSettingsChanged;
         EnergySaver.Changed += OnEnergySaverChanged;
-        Volume.Value = App.Volume;
+        UpdateVolume();
         ApplySkipSettings();
         UpdateSleepPill();
+        ApplyLayout();
         RenderTrack();
         RenderQueue();
         RenderPlayState();
-        ApplyLayout();
-        if (_lyricsOpen)
-        {
-            // The panel was left open when the page was closed: it starts following again.
-            _lyrics?.PlayEntrance();
-        }
     }
 
     protected override void OnNavigatedFrom(NavigationEventArgs args)
     {
         base.OnNavigatedFrom(args);
+        _active = false;
+        if (_appWindow is not null) _appWindow.Changed -= OnPlayerWindowChanged;
+        _appWindow = null;
         Playback.TrackChanged -= OnTrackChanged;
         Playback.QueueChanged -= OnQueueChanged;
         Playback.PlayStateChanged -= OnPlayStateChanged;
         Playback.PositionTick -= OnPositionTick;
+        Playback.VolumeChanged -= UpdateVolume;
         Playback.SleepChanged -= OnSleepChanged;
         App.Library.Changed -= OnLibraryChanged;
         Profiles.Roster.Changed -= OnProfileChanged;
@@ -153,11 +167,28 @@ public sealed partial class NowPlayingPage : Page
         App.Settings.Changed -= OnSettingsChanged;
         EnergySaver.Changed -= OnEnergySaverChanged;
         _lyrics?.Pause();
+        _lyricsFor = null;
+        _paletteFor = null;
+        _displayedSong = null;
+        _undoTimer.Stop();
+        _cleared = null;
+        _dragging = false;
+        _dragged = null;
+        _upcomingVersion = -1;
         Drift.Stop();
+        _backdropDrifting = false;
     }
 
     private void OnTrackChanged() => DispatcherQueue.TryEnqueue(RenderTrack);
-    private void OnQueueChanged() => DispatcherQueue.TryEnqueue(RenderQueue);
+    private void OnQueueChanged()
+    {
+        if (_queueRefreshPending) return;
+        _queueRefreshPending = DispatcherQueue.TryEnqueue(() =>
+        {
+            _queueRefreshPending = false;
+            if (_active && _windowVisible && QueueOpen) RenderQueue();
+        });
+    }
     private void OnPlayStateChanged() => DispatcherQueue.TryEnqueue(RenderPlayState);
     private void OnLibraryChanged() => DispatcherQueue.TryEnqueue(() =>
     {
@@ -169,35 +200,62 @@ public sealed partial class NowPlayingPage : Page
     {
         if (Playback.CurrentPlaylist?.SamePlaylist(changed) == true) RenderPlaylistOrigin(reloadCover: true);
     });
-    private void OnSettingsChanged(Settings settings) => DispatcherQueue.TryEnqueue(ApplySkipSettings);
+    private void OnSettingsChanged(Settings settings) => DispatcherQueue.TryEnqueue(() =>
+    {
+        if (!_active) return;
+        ApplySkipSettings();
+        RenderPlayState();
+    });
     private void OnSleepChanged() => DispatcherQueue.TryEnqueue(UpdateSleepPill);
     private void OnEnergySaverChanged() => DispatcherQueue.TryEnqueue(RenderPlayState);
+
+    private bool IsPlayerWindowVisible() => _appWindow is not { } window
+        || (window.IsVisible && (window.Presenter as OverlappedPresenter)?.State != OverlappedPresenterState.Minimized);
+
+    private void OnPlayerWindowChanged(AppWindow sender, AppWindowChangedEventArgs args)
+    {
+        var visible = IsPlayerWindowVisible();
+        if (_windowVisible == visible) return;
+        _windowVisible = visible;
+        if (visible)
+        {
+            RenderTrack();
+            if (QueueOpen) RenderQueue();
+        }
+        RenderPlayState();
+    }
 
     // MARK: the song
 
     private void RenderTrack()
     {
+        if (!_active || !_windowVisible) return;
         var song = Playback.CurrentSong;
         RenderPlaylistOrigin();
         Idle.Visibility = song is null ? Visibility.Visible : Visibility.Collapsed;
         Layout.Visibility = song is null ? Visibility.Collapsed : Visibility.Visible;
         if (song is null)
         {
+            _displayedSong = null;
             return;
         }
 
-        TitleText.Text = song.Title;
-        ArtistLink.Content = song.ArtistLine;
-        ArtistLink.IsEnabled = song.Artists.Any(a => a.Id is not null);
-        SkipBackButton.IsEnabled = SkipForwardButton.IsEnabled = true;
-        Art.SetSource(Cover, song.Artwork);
-        Art.SetSource(CompactCoverImage, song.Artwork);
-        Art.SetSource(BackdropArt, song.Artwork);
-        FailureBanner.Visibility = Visibility.Collapsed;
-        UpdateLike();
+        if (_displayedSong != song)
+        {
+            _displayedSong = song;
+            TitleText.Text = song.Title;
+            ArtistLink.Content = song.ArtistLine;
+            ArtistLink.IsEnabled = song.Artists.Any(a => a.Id is not null);
+            SkipBackButton.IsEnabled = SkipForwardButton.IsEnabled = true;
+            Art.SetSource(Cover, song.Artwork);
+            Art.SetSource(CompactCoverImage, song.Artwork);
+            Art.SetSource(BackdropArt, song.Artwork);
+            FailureBanner.Visibility = Visibility.Collapsed;
+            UpdateLike();
+            _ = PaintAsync(song);
+        }
         OnPositionTick();
-        _ = PaintAsync(song);
-        _ = LoadLyricsAsync(song);
+        if (LyricsOpen) _ = LoadLyricsAsync(song);
     }
 
     private void RenderPlaylistOrigin(bool reloadCover = false)
@@ -227,7 +285,7 @@ public sealed partial class NowPlayingPage : Page
     /// </summary>
     private async System.Threading.Tasks.Task LoadLyricsAsync(Song song)
     {
-        if (_lyricsFor == song.Id)
+        if (!_active || !_windowVisible || !LyricsOpen || _lyricsFor == song.Id)
         {
             return;
         }
@@ -246,9 +304,15 @@ public sealed partial class NowPlayingPage : Page
             lyrics = null;
         }
 
-        if (_lyricsFor != song.Id)
+        if (!_active || _lyricsFor != song.Id)
         {
             return; // another song took over while the services were answering
+        }
+
+        if (!_windowVisible || !LyricsOpen)
+        {
+            _lyricsFor = null;
+            return;
         }
 
         _lyrics?.Load(lyrics);
@@ -259,7 +323,9 @@ public sealed partial class NowPlayingPage : Page
             return;
         }
 
-        _lyrics?.PlayEntrance();
+        if (SystemMotion) _lyrics?.PlayEntrance();
+        UpdateLyricsPlayback();
+        UpdateLyricsPosition();
     }
     /// <summary>The background takes the cover's three strongest colours.</summary>
     private async System.Threading.Tasks.Task PaintAsync(Song song)
@@ -269,7 +335,7 @@ public sealed partial class NowPlayingPage : Page
         // The last song's tint goes at once; the blurred cover carries the page meanwhile.
         Fade(BlobA, 0);
         Fade(BlobB, 0);
-        if (await ArtAccent.PaletteAsync(song.Artwork) is not { Length: >= 2 } palette || _paletteFor != song.Id)
+        if (await ArtAccent.PaletteAsync(song.Artwork) is not { Length: >= 2 } palette || !_active || _paletteFor != song.Id)
         {
             return;
         }
@@ -284,8 +350,14 @@ public sealed partial class NowPlayingPage : Page
 
     /// <summary>A plain storyboard fade. [scar] An OpacityTransition on these drifting
     /// rectangles fails the whole page's XAML load (XamlParseException at InitializeComponent).</summary>
-    private static void Fade(UIElement element, double to)
+    private void Fade(UIElement element, double to)
     {
+        if (!SystemMotion)
+        {
+            element.Opacity = to;
+            return;
+        }
+
         var animation = new Microsoft.UI.Xaml.Media.Animation.DoubleAnimation
         {
             To = to,
@@ -310,6 +382,7 @@ public sealed partial class NowPlayingPage : Page
 
     private void RenderPlayState()
     {
+        if (!_active) return;
         var playing = Playback.IsPlaying;
         var loading = Playback.IsLoading;
         PlayIcon.Glyph = playing ? "" : "";
@@ -320,20 +393,36 @@ public sealed partial class NowPlayingPage : Page
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(PlayButton, playing ? "Pause" : "Play");
 
         // The cover sits full size while sound plays, a little back while paused or loading.
-        (playing && !loading ? CoverIn : CoverOut).Begin();
+        var expanded = playing && !loading;
+        var motion = _windowVisible && SystemMotion;
+        if (_coverState != (expanded, motion))
+        {
+            _coverState = (expanded, motion);
+            if (motion) (expanded ? CoverIn : CoverOut).Begin();
+            else
+            {
+                CoverIn.Stop();
+                CoverOut.Stop();
+                CoverScale.ScaleX = CoverScale.ScaleY = expanded ? 1 : 0.86;
+            }
+        }
         // The cover's colours drift behind the player, unless the listener turned that off,
         // the system has animations turned off, or Windows Energy Saver is on.
-        var animate = new Windows.UI.ViewManagement.UISettings().AnimationsEnabled &&
-            Koda.Core.Settings.Current.AnimatesPlayerBackground &&
-            !EnergySaver.IsOn;
-        if (playing && animate) Drift.Begin();
-        else Drift.Pause();
+        var drift = playing && motion && App.Settings.AnimatesPlayerBackground;
+        if (drift != _backdropDrifting)
+        {
+            _backdropDrifting = drift;
+            if (drift) Drift.Begin();
+            else Drift.Pause();
+        }
+
+        UpdateLyricsPlayback();
     }
 
     private void OnPositionTick()
     {
         var duration = Playback.DurationSeconds;
-        if (_scrubbing || duration <= 0)
+        if (!_windowVisible || _scrubbing || duration <= 0)
         {
             return;
         }
@@ -341,8 +430,19 @@ public sealed partial class NowPlayingPage : Page
         Scrubber.Maximum = duration;
         Scrubber.Value = Math.Clamp(Playback.PositionSeconds, 0, duration);
         UpdateTimes(Scrubber.Value);
+        if (LyricsOpen) UpdateLyricsPosition();
+    }
+
+    private void UpdateLyricsPosition()
+    {
         _lyrics?.SetPosition(Playback.PositionSeconds);
         _lyrics?.Follow();
+    }
+
+    private void UpdateLyricsPlayback()
+    {
+        _lyrics?.SetPlayback(_windowVisible && LyricsOpen && Playback.IsPlaying && !Playback.IsLoading,
+            motion: SystemMotion && App.Settings.LyricsMotion);
     }
 
     private void UpdateTimes(double position)
@@ -366,26 +466,18 @@ public sealed partial class NowPlayingPage : Page
         var repeat = Playback.Queue.Repeat;
         RepeatToggle.IsChecked = repeat != RepeatMode.Off;
         RepeatIcon.Glyph = repeat == RepeatMode.One ? "" : "";
-        RepeatText.Text = repeat == RepeatMode.One ? "Repeat one" : "Repeat";
+        RepeatText.Text = repeat switch
+        {
+            RepeatMode.All => "Repeat all",
+            RepeatMode.One => "Repeat one",
+            _ => "Repeat",
+        };
         AutoplayToggle.IsChecked = Playback.Autoplay;
 
-        if (!_dragging)
-        {
-            var upcoming = Playback.Queue.Upcoming;
-            // Only what changed: the list keeps its scroll while autoplay appends.
-            var same = upcoming.Count >= _upcoming.Count && _upcoming.Select((item, i) => upcoming[i].Id == item.Id).All(x => x);
-            if (same)
-            {
-                foreach (var item in upcoming.Skip(_upcoming.Count)) _upcoming.Add(item);
-            }
-            else
-            {
-                _upcoming.Clear();
-                foreach (var item in upcoming) _upcoming.Add(item);
-            }
-        }
+        if (QueueOpen && !_dragging) SyncUpcoming();
 
-        MoreSkeleton.Content = Playback.IsExtending ? Skeletons.Rows(3) : null;
+        if (!Playback.IsExtending) MoreSkeleton.Content = null;
+        else MoreSkeleton.Content ??= Skeletons.Rows(3);
         EndNote.Visibility = !Playback.Autoplay && Playback.Queue.Repeat == RepeatMode.Off ? Visibility.Visible : Visibility.Collapsed;
         EndNote.Text = _upcoming.Count == 0
             ? "Turn on Autoplay to keep going with songs like this one."
@@ -393,27 +485,67 @@ public sealed partial class NowPlayingPage : Page
         RenderQueueHeader();
     }
 
+    private void SyncUpcoming()
+    {
+        var queue = Playback.Queue;
+        var start = queue.UpcomingStart;
+        var count = queue.UpcomingCount;
+        if (queue.ItemsVersion == _upcomingVersion && start == _upcomingStart) return;
+
+        // A normal advance removes the first row. Reuse the remaining rows and their scroll position.
+        var skipped = start - _upcomingStart;
+        if (queue.ItemsVersion == _upcomingVersion && skipped >= 0 && skipped <= 4 && _upcoming.Count - skipped == count)
+        {
+            for (var i = 0; i < skipped; i++) _upcoming.RemoveAt(0);
+        }
+        else if (_upcomingVersion >= 0 && count >= _upcoming.Count && count - _upcoming.Count <= 16
+            && _upcoming.Select((item, index) => item.Id == queue.Items[start + index].Id).All(same => same))
+        {
+            for (var i = _upcoming.Count; i < count; i++) _upcoming.Add(queue.Items[start + i]);
+        }
+        else
+        {
+            // A new order is bound once, without one UI notification per track.
+            _upcoming = new ObservableCollection<QueueItem>(queue.Items.Skip(start));
+            UpNext.ItemsSource = _upcoming;
+        }
+
+        _upcomingVersion = queue.ItemsVersion;
+        _upcomingStart = start;
+    }
+
     private void RenderQueueHeader()
     {
-        UpNextTitle.Text = _upcoming.Count == 0 ? "Nothing up next" : "Up Next";
+        if (_cleared is { } cleared && !Playback.Queue.CanRestoreUpcoming(cleared))
+        {
+            _cleared = null;
+            _undoTimer.Stop();
+        }
+
+        UpNextTitle.Text = _upcoming.Count > 0 ? "Up Next" : Playback.Queue.Repeat switch
+        {
+            RepeatMode.All when Playback.Queue.Current is not null => "Queue repeats next",
+            RepeatMode.One when Playback.Queue.Current is not null => "Current song repeats",
+            _ => "Nothing up next",
+        };
         UndoLink.Visibility = _cleared is not null ? Visibility.Visible : Visibility.Collapsed;
         ClearLink.Visibility = _cleared is null && _upcoming.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 
     private void OnUpNextLoaded(object sender, RoutedEventArgs e)
     {
-        _queueScroller ??= Descendant<ScrollViewer>(UpNext);
-        if (_queueScroller is { } scroller)
-        {
-            // Near the end of the list, Autoplay fetches more (Mac: the queue never runs dry).
-            scroller.ViewChanged += (_, _) =>
-            {
-                if (scroller.ScrollableHeight > 0 && scroller.VerticalOffset > scroller.ScrollableHeight - 400)
-                {
-                    _ = Playback.LoadMoreAsync();
-                }
-            };
-        }
+        var scroller = Descendant<ScrollViewer>(UpNext);
+        if (_queueScroller == scroller) return;
+        if (_queueScroller is not null) _queueScroller.ViewChanged -= OnQueueScrolled;
+        _queueScroller = scroller;
+        if (scroller is not null) scroller.ViewChanged += OnQueueScrolled;
+    }
+
+    private void OnQueueScrolled(object? sender, ScrollViewerViewChangedEventArgs e)
+    {
+        if (_active && QueueOpen && sender is ScrollViewer scroller
+            && scroller.ScrollableHeight > 0 && scroller.VerticalOffset > scroller.ScrollableHeight - 400)
+            _ = Playback.LoadMoreAsync();
     }
 
     private void OnUpNextClick(object sender, ItemClickEventArgs e)
@@ -428,7 +560,9 @@ public sealed partial class NowPlayingPage : Page
             return;
         }
 
-        var menu = SongMenu.Build(item.Song, [.. Playback.Queue.Items.Select(i => i.Song)]);
+        var playlist = item.Source is { } source && source.ProfileKey == Profiles.ActiveKey ? source.Playlist : null;
+        var menu = SongMenu.Build(item.Song, [], playlist: playlist,
+            playNow: _song => _ = Playback.JumpAsync(item.Id));
         var remove = new MenuFlyoutItem { Text = "Remove from queue", Icon = new FontIcon { Glyph = "" } };
         remove.Click += (_, _) => Playback.Remove(item.Id);
         menu.Items.Insert(0, remove);
@@ -440,20 +574,30 @@ public sealed partial class NowPlayingPage : Page
 
     private void OnDragStarting(object sender, DragItemsStartingEventArgs e)
     {
+        if (Playback.Queue.ItemsVersion != _upcomingVersion || Playback.Queue.UpcomingStart != _upcomingStart)
+        {
+            e.Cancel = true;
+            return;
+        }
+
         _dragging = true;
         _dragged = e.Items.FirstOrDefault() as QueueItem;
         _dragFrom = _dragged is null ? -1 : _upcoming.IndexOf(_dragged);
+        _dragVersion = _upcomingVersion;
+        _dragCurrent = Playback.Queue.Current?.Id;
     }
 
     private void OnDragCompleted(ListViewBase sender, DragItemsCompletedEventArgs args)
     {
         _dragging = false;
-        if (_dragged is { } item && _dragFrom >= 0 && _upcoming.IndexOf(item) is var to and >= 0 && to != _dragFrom)
+        if (Playback.Queue.ItemsVersion == _dragVersion && Playback.Queue.Current?.Id == _dragCurrent
+            && _dragged is { } item && _dragFrom >= 0 && _upcoming.IndexOf(item) is var to and >= 0 && to != _dragFrom)
         {
             Playback.MoveUpcoming(_dragFrom, to);
         }
 
         _dragged = null;
+        _upcomingVersion = -1;
         RenderQueue();
     }
 
@@ -465,20 +609,18 @@ public sealed partial class NowPlayingPage : Page
 
     private void OnClearClick(object sender, RoutedEventArgs e)
     {
-        _cleared = [.. Playback.Queue.Upcoming.Select(i => i.Song)];
-        Playback.ClearUpcoming();
-        _undoTimer.Start();
+        _cleared = Playback.ClearUpcoming();
+        if (_cleared is not null) _undoTimer.Start();
         RenderQueueHeader();
     }
 
-    /// <summary>Autoplay may have filled the queue again since; what was cleared comes back in its place.</summary>
     private void OnUndoClick(object sender, RoutedEventArgs e)
     {
-        if (_cleared is not { } songs) return;
+        if (_cleared is not { } cleared) return;
         _undoTimer.Stop();
         _cleared = null;
-        Playback.ClearUpcoming();
-        Playback.AddToQueue(songs);
+        Playback.RestoreUpcoming(cleared);
+        RenderQueue();
     }
 
     // MARK: controls
@@ -510,10 +652,18 @@ public sealed partial class NowPlayingPage : Page
         Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(SkipForwardButton, ahead);
     }
 
-    private void OnVolumeChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e)
-    {
+    private void OnVolumeChanged(object sender, Microsoft.UI.Xaml.Controls.Primitives.RangeBaseValueChangedEventArgs e) =>
         Playback.SetVolumePercent(e.NewValue);
-        App.SetVolume(e.NewValue);
+
+    private void OnMuteClick(object sender, RoutedEventArgs e) => Playback.SetMuted(!Playback.IsMuted);
+
+    private void UpdateVolume()
+    {
+        Volume.Value = Playback.VolumePercent;
+        VolumeMuteIcon.Glyph = Playback.IsMuted ? "\uE74F" : "\uE767";
+        var label = Playback.IsMuted ? "Unmute" : "Mute";
+        ToolTipService.SetToolTip(VolumeMuteButton, label);
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(VolumeMuteButton, label);
     }
 
     private void OnLikeClick(object sender, RoutedEventArgs e)
@@ -531,9 +681,10 @@ public sealed partial class NowPlayingPage : Page
 
     private void OnMoreClick(object sender, RoutedEventArgs e)
     {
-        if (Playback.CurrentSong is { } song)
+        if (Playback.Queue.Current is { } item)
         {
-            var menu = SongMenu.Build(song, [.. Playback.Queue.Items.Select(i => i.Song)]);
+            var menu = SongMenu.Build(item.Song, [], playlist: Playback.CurrentPlaylist,
+                playNow: _song => _ = Playback.JumpAsync(item.Id));
             menu.Items.Insert(0, BuildSleepMenu());
             menu.Items.Insert(1, new MenuFlyoutSeparator());
             menu.ShowAt(MoreButton);
@@ -629,36 +780,26 @@ public sealed partial class NowPlayingPage : Page
 
     private void OnRetryClick(object sender, RoutedEventArgs e) => Playback.Toggle();
 
-    private void OnQueueToggleClick(object sender, RoutedEventArgs e)
+    private void OnQueueToggleClick(object sender, RoutedEventArgs e) =>
+        SetPanel(QueueToggle.IsChecked == true ? NowPlayingPanel.Queue : NowPlayingPanel.None);
+
+    internal void ShowQueue(bool toggle = false) =>
+        SetPanel(toggle && QueueOpen ? NowPlayingPanel.None : NowPlayingPanel.Queue);
+
+    private void OnLyricsToggleClick(object sender, RoutedEventArgs e) =>
+        SetPanel(LyricsToggle.IsChecked == true ? NowPlayingPanel.Lyrics : NowPlayingPanel.None);
+
+    private void SetPanel(NowPlayingPanel panel)
     {
-        _queueOpen = QueueToggle.IsChecked == true;
-        if (_queueOpen)
-        {
-            _lyricsOpen = false;
-        }
-
+        if (App.Settings.PlayerPanel != panel) App.Settings.Update(settings => settings.PlayerPanel = panel);
         ApplyLayout();
-    }
-
-    private void OnLyricsToggleClick(object sender, RoutedEventArgs e)
-    {
-        _lyricsOpen = LyricsToggle.IsChecked == true;
-        if (_lyricsOpen)
+        if (QueueOpen) RenderQueue();
+        if (LyricsOpen && Playback.CurrentSong is { } song)
         {
-            _queueOpen = false;
+            _ = LoadLyricsAsync(song);
+            UpdateLyricsPosition();
         }
-
-        ApplyLayout();
-        if (_lyricsOpen)
-        {
-            _lyrics?.PlayEntrance();
-            _lyrics?.SetPosition(Playback.PositionSeconds);
-            _lyrics?.Follow();
-        }
-        else
-        {
-            _lyrics?.Pause();
-        }
+        UpdateLyricsPlayback();
     }
 
     private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
@@ -691,17 +832,19 @@ public sealed partial class NowPlayingPage : Page
     /// taking the cover's place with a compact header above it.</summary>
     private void ApplyLayout()
     {
-        QueueToggle.IsChecked = _queueOpen;
-        LyricsToggle.IsChecked = _lyricsOpen;
-        var open = _queueOpen || _lyricsOpen;
+        var queue = QueueOpen;
+        var lyrics = LyricsOpen;
+        QueueToggle.IsChecked = queue;
+        LyricsToggle.IsChecked = lyrics;
+        var open = queue || lyrics;
+        QueuePanel.Visibility = queue ? Visibility.Visible : Visibility.Collapsed;
+        LyricsView.Visibility = lyrics ? Visibility.Visible : Visibility.Collapsed;
 
         PlaceQueuePanel();
         PlaceLyricsPanel();
 
         if (_wide)
         {
-            QueuePanel.Visibility = _queueOpen ? Visibility.Visible : Visibility.Collapsed;
-            LyricsView.Visibility = _lyricsOpen ? Visibility.Visible : Visibility.Collapsed;
             PanelColumn.Width = open ? new GridLength(1.2, GridUnitType.Star) : new GridLength(0);
             Layout.ColumnSpacing = open ? 64 : 0;
             CoverBox.Visibility = Visibility.Visible;
@@ -711,8 +854,6 @@ public sealed partial class NowPlayingPage : Page
         }
         else
         {
-            QueuePanel.Visibility = _queueOpen ? Visibility.Visible : Visibility.Collapsed;
-            LyricsView.Visibility = _lyricsOpen ? Visibility.Visible : Visibility.Collapsed;
             PanelColumn.Width = new GridLength(0);
             Layout.ColumnSpacing = 0;
             CoverBox.Visibility = open ? Visibility.Collapsed : Visibility.Visible;

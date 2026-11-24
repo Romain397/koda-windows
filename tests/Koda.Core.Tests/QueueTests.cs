@@ -1,5 +1,7 @@
+using System.Text.Json;
 using Koda.Core;
 using Koda.Core.Parsing;
+using Koda.Playback;
 
 namespace Koda.Core.Tests;
 
@@ -27,4 +29,149 @@ public class QueueTests
         Assert.Empty(queue.Songs);
         Assert.Null(queue.Continuation);
     }
+
+    [Fact]
+    public void ShuffledPlaylistKeepsEverySongWhenRepeatIsEnabledAtTheEnd()
+    {
+        var songs = PlaylistSongs(120);
+        var queue = new PlayQueue();
+        queue.Replace(songs, shuffled: true, source: Playlist);
+        var order = queue.Items.Select(item => item.Id).ToArray();
+        Assert.Equal(songs.Select(song => song.Id).Order(), queue.Items.Select(item => item.Song.Id).Order());
+        Assert.Equal(0, queue.CurrentIndex);
+
+        foreach (var id in order.Skip(1))
+        {
+            Assert.Equal(id, queue.Advance(automatic: true)?.Id);
+            queue.TrimHistory(keeping: 50);
+        }
+
+        Assert.Null(queue.Advance(automatic: true));
+        queue.Repeat = RepeatMode.All;
+        for (var round = 0; round < 2; round++)
+        {
+            foreach (var id in order)
+            {
+                Assert.Equal(id, queue.PeekNext(automatic: true)?.Id);
+                Assert.Equal(id, queue.Advance(automatic: true)?.Id);
+                queue.TrimHistory(keeping: 50);
+            }
+        }
+    }
+
+    [Fact]
+    public void SavedShuffleKeepsPlaybackOrderAndRestoresPlaylistOrderWhenDisabled()
+    {
+        var songs = PlaylistSongs(65);
+        var queue = new PlayQueue { Repeat = RepeatMode.All };
+        queue.Replace(songs, start: 60, shuffled: true, source: Playlist);
+        Assert.Equal(songs[60], queue.Current?.Song);
+        var order = queue.Items.Select(item => item.Song.Id).ToArray();
+
+        var saved = JsonSerializer.Deserialize<PlayQueue.Saved>(JsonSerializer.Serialize(queue.Save()))!;
+        var reopened = PlayQueue.Restore(saved);
+        Assert.True(reopened.IsPlaylist);
+        Assert.True(reopened.IsShuffled);
+        Assert.Equal(RepeatMode.All, reopened.Repeat);
+        Assert.Equal(order, reopened.Items.Select(item => item.Song.Id));
+        reopened.SetShuffle(false);
+        reopened.TrimHistory(keeping: 50);
+        Assert.Equal(songs, reopened.Items.Select(item => item.Song));
+        Assert.Equal(songs[60], reopened.Current?.Song);
+    }
+
+    [Fact]
+    public void PlaylistKeepsItsSongsWhileOldRadioHistoryIsTrimmed()
+    {
+        var songs = PlaylistSongs(75);
+        var queue = new PlayQueue();
+        queue.Replace(songs, source: Playlist);
+        queue.Append(songs);
+        Assert.True(queue.Jump(queue.Items[^1].Id));
+
+        queue.TrimHistory(keeping: 2);
+
+        Assert.Equal(songs, queue.Items.Take(songs.Length).Select(item => item.Song));
+        Assert.Equal(3, queue.Items.Count(item => item.Source is null));
+        Assert.Null(queue.PeekNext(automatic: true));
+    }
+
+    [Fact]
+    public void UndoRestoresPlaylistOriginAndOriginalOrderAfterShuffle()
+    {
+        var songs = PlaylistSongs(70);
+        var queue = new PlayQueue();
+        queue.Replace(songs, shuffled: true, source: Playlist);
+        var order = queue.Items.Select(item => item.Id).ToArray();
+        var cleared = Assert.IsType<PlayQueue.ClearedUpcoming>(queue.ClearUpcoming());
+        Assert.Equal(0, queue.UpcomingCount);
+
+        Assert.True(queue.RestoreUpcoming(cleared));
+        Assert.Equal(order, queue.Items.Select(item => item.Id));
+        Assert.All(queue.Items, item => Assert.Equal(Playlist, item.Source));
+        queue.SetShuffle(false);
+        Assert.Equal(songs, queue.Items.Select(item => item.Song));
+    }
+
+    [Fact]
+    public void UndoCannotOverwriteANewerQueueEdit()
+    {
+        var songs = PlaylistSongs(5);
+        var queue = new PlayQueue();
+        queue.Replace(songs, source: Playlist);
+        var cleared = Assert.IsType<PlayQueue.ClearedUpcoming>(queue.ClearUpcoming());
+        queue.Append([songs[2]]);
+
+        Assert.False(queue.RestoreUpcoming(cleared));
+        Assert.Equal(songs[2], Assert.Single(queue.Upcoming).Song);
+    }
+
+    [Fact]
+    public void QueueSnapshotReusesTracksWhenOnlyThePositionChanges()
+    {
+        var queue = new PlayQueue();
+        queue.Replace(PlaylistSongs(1000), shuffled: true, source: Playlist);
+        var initial = queue.Save();
+        queue.Advance(automatic: true);
+        queue.Repeat = RepeatMode.All;
+
+        var advanced = queue.Save();
+        Assert.Same(initial.Songs, advanced.Songs);
+        Assert.Same(initial.OriginalOrder, advanced.OriginalOrder);
+        Assert.Equal(1, advanced.Current);
+        Assert.Equal(RepeatMode.All, advanced.Repeat);
+        var removed = queue.Upcoming[0];
+        Assert.True(queue.Remove(removed.Id));
+        Assert.DoesNotContain(removed.Song, queue.Save().Songs);
+        Assert.Contains(removed.Song, initial.Songs);
+    }
+
+    [Fact]
+    public async Task BackgroundQueueSaveRetainsTheNewestCompleteSnapshot()
+    {
+        var path = Path.Combine(Fixtures.Scratch, $"queue-{Guid.NewGuid():N}.json");
+        var store = new QueueStateStore(path);
+        var queue = new PlayQueue { Repeat = RepeatMode.All };
+        queue.Replace(PlaylistSongs(1200), shuffled: true, source: Playlist);
+        var pending = new List<Task>();
+        for (var index = 0; index < 60; index++)
+        {
+            queue.Advance(automatic: true);
+            pending.Add(store.SaveAsync(new(queue.Save(), index)));
+        }
+
+        await Task.WhenAll(pending);
+        var saved = Assert.IsType<QueueStateStore.State>(store.Load());
+        Assert.Equal(59, saved.Position);
+        Assert.Equal(60, saved.Queue.Current);
+        Assert.Equal(1200, saved.Queue.Songs.Length);
+        Assert.Equal(RepeatMode.All, saved.Queue.Repeat);
+        Assert.False(File.Exists(path + ".tmp"));
+    }
+
+    private static readonly PlaylistSource Playlist = new("test", new PlaylistReference("PLtest", "Playlist", false));
+
+    private static Song[] PlaylistSongs(int count) =>
+        [.. Enumerable.Range(0, count).Select(index => new Song($"song-{index}", $"Song {index}",
+            "Artist", [], null, null, null, false, null))];
 }

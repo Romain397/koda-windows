@@ -284,7 +284,7 @@ public record ResolvedStream(
     int Itag,
     long? ContentLength,
     double? Duration,
-    /// <summary>How far the track sits above YouTube's -14 LUFS target, when the format says.</summary>
+    /// <summary>The track's signed loudness offset from YouTube's reference, when the format says.</summary>
     double? LoudnessDb,
     /// <summary>When googlevideo stops honouring the URL (its <c>expire</c> parameter).</summary>
     DateTimeOffset? ExpiresAt)
