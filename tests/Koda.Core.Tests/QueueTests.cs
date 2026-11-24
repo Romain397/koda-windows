@@ -31,7 +31,7 @@ public class QueueTests
     }
 
     [Fact]
-    public void ShuffledPlaylistKeepsEverySongWhenRepeatIsEnabledAtTheEnd()
+    public void ShuffledPlaylistMakesANewCompleteRoundWhenRepeatIsEnabledAtTheEnd()
     {
         var songs = PlaylistSongs(120);
         var queue = new PlayQueue();
@@ -50,13 +50,87 @@ public class QueueTests
         queue.Repeat = RepeatMode.All;
         for (var round = 0; round < 2; round++)
         {
-            foreach (var id in order)
+            var last = queue.Current!.Song.Id;
+            var next = queue.PeekNext(automatic: true);
+            Assert.NotNull(next);
+            Assert.NotEqual(last, next.Song.Id);
+            Assert.Equal(next, queue.PeekNext(automatic: false));
+            Assert.Equal(next, queue.Advance(automatic: true));
+
+            var newOrder = queue.Items.Select(item => item.Id).ToArray();
+            Assert.False(order.SequenceEqual(newOrder));
+            Assert.Equal(order.Order(), newOrder.Order());
+
+            foreach (var id in newOrder.Skip(1))
             {
                 Assert.Equal(id, queue.PeekNext(automatic: true)?.Id);
                 Assert.Equal(id, queue.Advance(automatic: true)?.Id);
                 queue.TrimHistory(keeping: 50);
             }
+
+            order = newOrder;
         }
+    }
+
+    [Fact]
+    public void PreviousAtTheStartOfANewShuffleReturnsToTheTrackActuallyPlayed()
+    {
+        var queue = new PlayQueue { Repeat = RepeatMode.All };
+        queue.Replace(PlaylistSongs(12), shuffled: true, source: Playlist);
+        var previous = queue.Items[^1];
+        Assert.True(queue.Jump(previous.Id));
+        var next = queue.PeekNext(automatic: false);
+
+        Assert.Equal(next, queue.Advance(automatic: false));
+        Assert.Equal(previous, queue.Retreat());
+        Assert.Equal(next, queue.PeekNext(automatic: false));
+        Assert.Equal(next, queue.Advance(automatic: false));
+    }
+
+    [Fact]
+    public void SequentialRepeatWrapsAndRepeatOneKeepsTheCurrentSong()
+    {
+        var queue = new PlayQueue { Repeat = RepeatMode.All };
+        var songs = PlaylistSongs(3);
+        queue.Replace(songs, start: 2, source: Playlist);
+        Assert.Equal(songs[0], queue.Advance(automatic: true)?.Song);
+        Assert.Equal(songs, queue.Items.Select(item => item.Song));
+
+        queue.SetShuffle(true);
+        queue.Repeat = RepeatMode.One;
+        Assert.True(queue.Jump(queue.Items[^1].Id));
+        Assert.Equal(queue.Current, queue.Advance(automatic: true));
+    }
+
+    [Fact]
+    public void APartialSavedPlaylistAppendsMissingTracksBeforeTheNextShuffle()
+    {
+        var songs = PlaylistSongs(120);
+        var saved = new PlayQueue.Saved(songs.Take(30).ToArray(), 29, true, RepeatMode.All,
+            Sources: Enumerable.Repeat<PlaylistSource?>(Playlist, 30).ToArray());
+        var queue = PlayQueue.Restore(saved);
+        var current = queue.Current;
+        var oldPreview = queue.PeekNext(automatic: true);
+
+        Assert.Equal(Playlist, queue.IncompletePlaylist);
+        Assert.True(queue.CompleteRestoredPlaylist(Playlist, songs));
+        Assert.Null(queue.IncompletePlaylist);
+        Assert.Equal(current, queue.Current);
+        Assert.Equal(90, queue.UpcomingCount);
+        Assert.NotEqual(oldPreview, queue.PeekNext(automatic: true));
+        Assert.Equal(songs.Skip(30).Select(song => song.Id).Order(),
+            queue.Upcoming.Select(item => item.Song.Id).Order());
+        Assert.Null(PlayQueue.Restore(queue.Save()).IncompletePlaylist);
+    }
+
+    [Fact]
+    public void TwoSongShuffleDoesNotRepeatTheLastSongImmediately()
+    {
+        var queue = new PlayQueue { Repeat = RepeatMode.All };
+        queue.Replace(PlaylistSongs(2), shuffled: true, source: Playlist);
+        queue.Advance(automatic: true);
+        var last = queue.Current;
+        Assert.NotEqual(last, queue.Advance(automatic: true));
     }
 
     [Fact]

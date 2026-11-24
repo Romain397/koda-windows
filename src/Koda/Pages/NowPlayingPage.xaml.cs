@@ -524,6 +524,7 @@ public sealed partial class NowPlayingPage : Page
 
         UpNextTitle.Text = _upcoming.Count > 0 ? "Up Next" : Playback.Queue.Repeat switch
         {
+            RepeatMode.All when Playback.Queue.StartsShuffleRound => "New shuffle next",
             RepeatMode.All when Playback.Queue.Current is not null => "Queue repeats next",
             RepeatMode.One when Playback.Queue.Current is not null => "Current song repeats",
             _ => "Nothing up next",

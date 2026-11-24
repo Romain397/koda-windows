@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Koda.Core;
 using Koda.Interop;
@@ -57,6 +58,9 @@ public sealed class PlaybackService
     private double _heardSinceRetry;
     private bool _recovering;
     private bool _extending;
+    private Task? _playlistRecovery;
+    private CancellationTokenSource? _playlistRecoveryCancellation;
+    private DateTimeOffset _playlistRecoveryAfter;
     /// <summary>Bumped per play of a song (a repeat round included), so a slow resolve for a song
     /// skipped past is dropped and each play is reported once.</summary>
     private int _generation;
@@ -333,6 +337,7 @@ public sealed class PlaybackService
             return Task.CompletedTask;
         }
 
+        CancelPlaylistRecovery();
         _queue.Replace(songs, start, shuffled, SourceOf(playlist));
         return PlayCurrentAsync();
     }
@@ -497,6 +502,10 @@ public sealed class PlaybackService
         {
             return;
         }
+
+        var generation = _generation;
+        if (_queue.UpcomingCount == 0) await RecoverRestoredPlaylistAsync();
+        if (generation != _generation) return;
 
         // The next song already waiting on standby starts at once, with the skip's short fade.
         if (_loaded && _queue.PeekNext(automatic: false) is { } next && _player.StandbyOccurrence == next.Id)
@@ -750,6 +759,8 @@ public sealed class PlaybackService
     public void SetShuffle(bool on)
     {
         _queue.SetShuffle(on);
+        if (on) _ = RecoverRestoredPlaylistAsync();
+        else CancelPlaylistRecovery();
         QueueEdited();
     }
 
@@ -784,6 +795,56 @@ public sealed class PlaybackService
         QueueChanged?.Invoke();
         SaveQueue();
         _ = PrepareNextAsync();
+    }
+
+    private Task RecoverRestoredPlaylistAsync()
+    {
+        if (!_queue.IsShuffled || _queue.IncompletePlaylist is not { } source
+            || Profiles.IsSwitching || source.ProfileKey != Profiles.ActiveKey)
+            return Task.CompletedTask;
+        if (_playlistRecovery is { IsCompleted: false } pending) return pending;
+        if (DateTimeOffset.UtcNow < _playlistRecoveryAfter) return Task.CompletedTask;
+
+        var cancellation = new CancellationTokenSource();
+        _playlistRecoveryCancellation = cancellation;
+        _playlistRecoveryAfter = DateTimeOffset.UtcNow.AddMinutes(1);
+        return _playlistRecovery = FetchRestoredPlaylistAsync(source, cancellation);
+    }
+
+    private async Task FetchRestoredPlaylistAsync(PlaylistSource source, CancellationTokenSource cancellation)
+    {
+        var session = App.Account.PlaylistSession;
+        try
+        {
+            var playlist = source.Playlist;
+            var songs = playlist.IsLocal
+                ? (Guid.TryParse(playlist.Id, out var id) ? App.Library.UserPlaylist(id)?.Songs ?? [] : [])
+                : await EngineHost.Music.PlaylistSongsAsync("VL" + PlaylistReference.YouTubeId(playlist.Id),
+                    limit: null, cancellation: cancellation.Token);
+            if (cancellation.IsCancellationRequested || Profiles.IsSwitching || source.ProfileKey != Profiles.ActiveKey
+                || (!playlist.IsLocal && session != App.Account.PlaylistSession)) return;
+            if (_queue.CompleteRestoredPlaylist(source, songs)) QueueEdited();
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (MusicException)
+        {
+            // Playback can carry on with the saved tracks while the playlist is unavailable.
+        }
+        finally
+        {
+            if (_playlistRecoveryCancellation == cancellation) _playlistRecoveryCancellation = null;
+            cancellation.Dispose();
+        }
+    }
+
+    private void CancelPlaylistRecovery()
+    {
+        _playlistRecoveryCancellation?.Cancel();
+        _playlistRecoveryCancellation = null;
+        _playlistRecovery = null;
+        _playlistRecoveryAfter = default;
     }
 
     // MARK: internals
@@ -825,6 +886,7 @@ public sealed class PlaybackService
         NotifyPlayState();
         SaveQueue();
         UpdateSmtcTrack(song);
+        _ = RecoverRestoredPlaylistAsync();
         if (!EnsureOutput())
         {
             return;
@@ -938,7 +1000,9 @@ public sealed class PlaybackService
             return;
         }
 
-        var next = _sleepAtEnd ? null : _queue.PeekNext(automatic: true);
+        var waitingForPlaylist = _queue.Repeat != RepeatMode.One && _queue.UpcomingCount == 0
+            && !RecoverRestoredPlaylistAsync().IsCompleted;
+        var next = _sleepAtEnd || waitingForPlaylist ? null : _queue.PeekNext(automatic: true);
         if (next is null)
         {
             _player.DiscardStandby();
@@ -985,7 +1049,9 @@ public sealed class PlaybackService
     /// what is left, as long as it is the song the queue would play anyway.</summary>
     private void OnCrossfadeDue()
     {
-        if (!_wantsToPlay || _sleepAtEnd || _queue.PeekNext(automatic: true) is not { } next ||
+        if (!_wantsToPlay || _sleepAtEnd || (_queue.Repeat != RepeatMode.One && _queue.UpcomingCount == 0
+                && _playlistRecovery is { IsCompleted: false })
+            || _queue.PeekNext(automatic: true) is not { } next ||
             _player.StandbyOccurrence != next.Id)
         {
             return;
@@ -1072,6 +1138,10 @@ public sealed class PlaybackService
             await RecoverAsync("the audio stream ended early");
             return;
         }
+
+        var generation = _generation;
+        if (_queue.Repeat != RepeatMode.One && _queue.UpcomingCount == 0) await RecoverRestoredPlaylistAsync();
+        if (generation != _generation || !_wantsToPlay) return;
 
         // The sleep timer's "end of song": the queue moves on to the next song, paused and
         // ready, as on the Mac. Play picks it up from its start.
@@ -1259,6 +1329,7 @@ public sealed class PlaybackService
     /// <summary>Terminal shutdown: keep the queue and place, stop audio, hand back the SMTC card.</summary>
     public void Shutdown()
     {
+        CancelPlaylistRecovery();
         SaveState();
         _positionTimer?.Stop();
         App.Library.Flush();
