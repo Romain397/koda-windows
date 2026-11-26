@@ -53,6 +53,8 @@ public sealed partial class MainWindow : Window
     private Taskbar? _taskbar;
     private MiniPlayerWindow? _mini;
     private readonly SmtcController _smtc = new();
+    private WindowsMixerVolume? _windowsMixer;
+    private DispatcherQueueTimer? _mixerSaveTimer;
     private nint _previousWndProc;
     private bool _placementApplied;
     private bool _scrubbing;
@@ -127,6 +129,7 @@ public sealed partial class MainWindow : Window
         JumpList.Apply();
 
         var dispatch = DispatcherQueue.GetForCurrentThread();
+        ConnectWindowsMixer(dispatch);
         // Energy Saver quietly stills the decorative motion; the pages that move follow it.
         EnergySaver.Watch(dispatch);
         Playback.Connect(dispatch, _smtc);
@@ -1397,6 +1400,33 @@ public sealed partial class MainWindow : Window
         VolumeSlider.Visibility = e.NewSize.Width < 760 ? Visibility.Collapsed : Visibility.Visible;
     }
 
+    // MARK: Windows mixer
+
+    private void ConnectWindowsMixer(DispatcherQueue dispatcher)
+    {
+        var timer = dispatcher.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(400);
+        timer.IsRepeating = false;
+        timer.Tick += (_, _) => SaveWindowsMixerVolume();
+        _mixerSaveTimer = timer;
+
+        _windowsMixer = new WindowsMixerVolume(App.Settings.WindowsMixerVolume);
+        _windowsMixer.Changed += () => dispatcher.TryEnqueue(() =>
+        {
+            if (_shutdown) return;
+            timer.Stop();
+            timer.Start();
+        });
+    }
+
+    private void SaveWindowsMixerVolume(bool capture = false)
+    {
+        var volume = capture ? _windowsMixer?.CaptureLevel() : _windowsMixer?.Level;
+        if (volume is not { } level || App.Settings.WindowsMixerVolume == level) return;
+        App.Settings.WindowsMixerVolume = level;
+        App.Settings.Save();
+    }
+
     // MARK: profiles
 
     /// <summary>Only with a choice to make: one profile, and nothing about profiles shows here.</summary>
@@ -1730,6 +1760,9 @@ public sealed partial class MainWindow : Window
         }
 
         _shutdown = true;
+        _mixerSaveTimer?.Stop();
+        SaveWindowsMixerVolume(capture: true);
+        _windowsMixer?.Dispose();
         CloseMiniPlayer();
         Video.Flush();
         Playback.Shutdown();
@@ -1748,6 +1781,7 @@ public sealed partial class MainWindow : Window
         if (_current is { } window)
         {
             WindowPlacement.Save(window.Handle);
+            window.SaveWindowsMixerVolume(capture: true);
         }
 
         PlaybackService.Instance.SaveState();

@@ -201,6 +201,9 @@ public sealed class Settings
     /// <summary>Koda's own volume, under the system's.</summary>
     public double Volume { get; set; } = 100;
 
+    /// <summary>The numeric level Windows applies to Koda's audio sessions.</summary>
+    public float? WindowsMixerVolume { get; set; }
+
     /// <summary>Whether the music player is muted, independent of the volume level.</summary>
     public bool MusicMuted { get; set; }
 

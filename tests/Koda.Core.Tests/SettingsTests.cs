@@ -54,6 +54,22 @@ public class SettingsTests
     }
 
     [Fact]
+    public void WindowsMixerVolumePreservesSilenceSeparatelyFromThePlayerSlider()
+    {
+        var path = Path.Combine(Fixtures.Scratch, $"mixer-settings-{Guid.NewGuid():N}.json");
+        File.WriteAllText(path, """{ "volume": 42 }""");
+        var settings = Settings.Load(path);
+        Assert.Null(settings.WindowsMixerVolume);
+
+        settings.WindowsMixerVolume = 0;
+        settings.Save();
+
+        var restored = Settings.Load(path);
+        Assert.Equal(42, restored.Volume);
+        Assert.Equal(0f, restored.WindowsMixerVolume);
+    }
+
+    [Fact]
     public void LoudnessProfileSurvivesRestartAndOldSettingsKeepTheirToggle()
     {
         var path = Path.Combine(Fixtures.Scratch, $"loudness-settings-{Guid.NewGuid():N}.json");
